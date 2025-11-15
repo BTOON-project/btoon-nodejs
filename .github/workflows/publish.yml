@@ -50,13 +50,34 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+          choco install vcpkg
       
-      - name: Build btoon-core
+      - name: Setup vcpkg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $env:VCPKG_ROOT = "C:\vcpkg"
+          $env:PATH = "$env:VCPKG_ROOT;$env:PATH"
+          vcpkg integrate install
+          vcpkg install zlib:x64-windows openssl:x64-windows
+      
+      - name: Build btoon-core (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
           cd core
           mkdir -p build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=OFF -DBUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build . --config Release
+          cd ../..
+      
+      - name: Build btoon-core (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd core
+          New-Item -ItemType Directory -Force -Path build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=OFF -DBUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
           cmake --build . --config Release
           cd ../..
       
