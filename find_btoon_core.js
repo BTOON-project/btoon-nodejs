@@ -14,9 +14,9 @@ if (coreInclude && fs.existsSync(coreInclude)) {
   process.exit(0);
 }
 
-// Try sibling directory (relative to this script)
+// Try sibling directory (relative to repo root)
 const scriptDir = __dirname;
-const siblingInclude = path.resolve(scriptDir, '../btoon-core/include');
+const siblingInclude = path.resolve(scriptDir, '..', '..', 'btoon-core', 'include');
 if (fs.existsSync(siblingInclude)) {
   console.log(siblingInclude);
   process.exit(0);

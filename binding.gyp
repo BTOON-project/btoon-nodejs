@@ -10,7 +10,7 @@
         "/usr/local/include"
       ],
       "libraries": [
-        "../btoon-core/build/libbtoon_core.a",
+        "-lbtoon_core",
         "-lz"
       ],
       "library_dirs": [
