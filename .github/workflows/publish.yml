@@ -52,7 +52,7 @@ jobs:
       
       - name: Build btoon-core
         run: |
-          cd btoon-core
+          cd core
           mkdir -p build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
