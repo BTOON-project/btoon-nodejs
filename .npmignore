@@ -1,0 +1,81 @@
+# Source files not needed for runtime
+*.cpp
+*.cc
+*.h
+*.hpp
+!btoon_node.cpp
+
+# Build configuration
+binding.gyp
+.gyp
+
+# Development files
+test/
+tests/
+examples/
+benchmark/
+docs/
+*.md
+!README.md
+!LICENSE
+
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# Core submodule source (include only built library)
+core/src/
+core/tests/
+core/tools/
+core/examples/
+core/docs/
+core/scripts/
+core/.git/
+core/.github/
+core/CMakeLists.txt
+core/*.md
+!core/include/
+!core/build/libbtoon_core.a
+
+# Git and CI
+.git/
+.github/
+.gitignore
+.gitmodules
+.travis.yml
+.appveyor.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+temp/
+tmp/
+
+# Development dependencies
+coverage/
+.nyc_output/
+
+# Scripts (except essential ones)
+scripts/
+!find_btoon_core.js
+!find_btoon_lib.js
+
+# Keep only essential files for npm package
+# The package should include:
+# - index.js (main entry)
+# - index.d.ts (TypeScript definitions)
+# - build/Release/btoon.node (native module)
+# - package.json
+# - README.md
+# - LICENSE
+# - find_btoon_*.js (helper scripts)

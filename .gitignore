@@ -1,0 +1,84 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+build/
+Release/
+Debug/
+*.node
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+
+# Prebuilt binaries (for distribution)
+prebuilds/
+build-tmp-*
+
+# Package files
+*.tgz
+npm-shrinkwrap.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# TypeScript
+*.tsbuildinfo
+dist/
+
+# Core submodule (managed by git)
+core/
+
+# Python cache (in case of mixed development)
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+temp/
+tmp/
+
+# Lock files (keep package-lock.json for reproducible builds)
+yarn.lock
+pnpm-lock.yaml
+
+# Documentation build
+docs/_build/
+docs/generated/
+
+# Benchmarks
+benchmark-results/
+
+# Security
+.cursor/rules/snyk_rules.mdc
