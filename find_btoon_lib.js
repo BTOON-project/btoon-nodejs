@@ -14,8 +14,15 @@ if (coreLibDir && fs.existsSync(coreLibDir)) {
   process.exit(0);
 }
 
-// Try sibling directory (relative to repo root)
+// Try submodule location (relative to btoon-nodejs root)
 const scriptDir = __dirname;
+const submoduleLibDir = path.resolve(scriptDir, 'core', 'build');
+if (fs.existsSync(submoduleLibDir)) {
+  console.log(submoduleLibDir);
+  process.exit(0);
+}
+
+// Try sibling directory (relative to repo root)
 const siblingLibDir = path.resolve(scriptDir, '..', '..', 'btoon-core', 'build');
 if (fs.existsSync(siblingLibDir)) {
   console.log(siblingLibDir);
