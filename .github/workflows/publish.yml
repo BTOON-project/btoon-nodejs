@@ -60,8 +60,8 @@ jobs:
           cmake --build . --config Release
           cd ../..
       
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies (skip install script)
+        run: npm ci --ignore-scripts
       
       - name: Build native module
         run: npm run build:release
