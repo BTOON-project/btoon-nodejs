@@ -4,7 +4,7 @@
       "target_name": "btoon",
       "sources": ["btoon_node.cpp"],
       "include_dirs": [
-        "<!@(node -p \"require('node-addon-api').include\")",
+        "node_modules/node-addon-api",
         "<!@(node find_btoon_core.js)",
         "../btoon-core/include",
         "/usr/local/include"
