@@ -207,7 +207,8 @@ Napi::Value Decode(const Napi::CallbackInfo& info) {
         auto value = btoon::decode(data, options);
         return value_to_napi(env, value);
     } catch (const std::exception& e) {
-        throw Napi::Error::New(env, e.what());
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
     }
 }
 
