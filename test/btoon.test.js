@@ -64,7 +64,8 @@ describe('BTOON Node.js Binding', () => {
 
   describe('Error Handling', () => {
     it('should throw an error for invalid encoded data', () => {
-      const invalidBuffer = Buffer.from('invalid data');
+      // Use data that starts with an invalid marker (0xc1 is reserved and not a valid BTOON marker)
+      const invalidBuffer = Buffer.from([0xc1, 0x00, 0x01, 0x02]);
       expect(() => btoon.decode(invalidBuffer)).to.throw();
     });
   });
