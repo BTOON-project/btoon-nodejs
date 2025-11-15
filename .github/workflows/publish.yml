@@ -52,12 +52,12 @@ jobs:
       
       - name: Build btoon-core
         run: |
-          cd ../btoon-core
+          cd btoon-core
           mkdir -p build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
-          cd ../../btoon-nodejs
+          cd ../..
       
       - name: Install dependencies
         run: npm ci
