@@ -56,7 +56,7 @@ jobs:
           cd core
           mkdir -p build
           cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=OFF -DBUILD_TESTS=OFF
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=OFF -DBUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build . --config Release
           cd ../..
       

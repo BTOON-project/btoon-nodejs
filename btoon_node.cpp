@@ -207,8 +207,9 @@ Napi::Value Decode(const Napi::CallbackInfo& info) {
         auto value = btoon::decode(data, options);
         return value_to_napi(env, value);
     } catch (const std::exception& e) {
-        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-        return env.Undefined();
+        throw Napi::Error::New(env, std::string("BTOON decode error: ") + e.what());
+    } catch (...) {
+        throw Napi::Error::New(env, "BTOON decode error: Unknown exception");
     }
 }
 
