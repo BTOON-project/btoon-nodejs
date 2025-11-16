@@ -34,6 +34,17 @@
           "cflags_cc": ["-std=c++20", "-fPIC"]
         }],
         ["OS=='win'", {
+          "include_dirs": [
+            "core/include",
+            "core/build/Release"
+          ],
+          "library_dirs": [
+            "core/build/Release"
+          ],
+          "libraries": [
+            "btoon_core.lib",
+            "ws2_32.lib"
+          ],
           "msvs_settings": {
             "VCCLCompilerTool": {
               "ExceptionHandling": 1,
