@@ -52,13 +52,16 @@
         ["OS=='win'", {
           "include_dirs": [
             "core/include",
-            "core/build/Release"
+            "core/build/Release",
+            "C:/vcpkg/installed/x64-windows/include"
           ],
           "library_dirs": [
-            "core/build/Release"
+            "core/build/Release",
+            "C:/vcpkg/installed/x64-windows/lib"
           ],
           "libraries": [
             "btoon_core.lib",
+            "zlib.lib",
             "ws2_32.lib"
           ],
           "msvs_settings": {
