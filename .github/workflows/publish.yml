@@ -14,9 +14,10 @@ jobs:
   build-and-publish:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [18, 20]
+        node: [18, 20, 22]
     
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +32,9 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       
       - name: Install Python (for node-gyp)
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
@@ -114,7 +115,7 @@ jobs:
         run: npm run prebuild:upload
 
       - name: Publish to npm
-        if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) && matrix.os == 'ubuntu-latest' && matrix.node == 20
+        if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) && matrix.os == 'ubuntu-latest' && matrix.node == 22
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -134,11 +135,11 @@ jobs:
     needs: build-and-publish
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       
       - name: Test published package
         run: |
