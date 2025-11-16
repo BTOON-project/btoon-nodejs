@@ -67,6 +67,7 @@
           "msvs_settings": {
             "VCCLCompilerTool": {
               "ExceptionHandling": 1,
+              "RuntimeLibrary": 2,
               "AdditionalOptions": ["/std:c++20"]
             }
           }
