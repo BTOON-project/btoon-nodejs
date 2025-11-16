@@ -3,10 +3,10 @@ name: Build Prebuilds
 on:
   workflow_dispatch:
     inputs:
-      upload_to_release:
-        description: 'Upload to GitHub Release (requires release tag)'
+      release_tag:
+        description: 'Release tag (e.g., v0.0.5) - leave empty to skip upload'
         required: false
-        default: 'false'
+        default: ''
   push:
     tags:
       - 'v*'
@@ -127,11 +127,13 @@ jobs:
           retention-days: 30
 
       - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.upload_to_release == 'true'
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         uses: softprops/action-gh-release@v1
         with:
           files: prebuilds/*.tar.gz
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
