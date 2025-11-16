@@ -1,6 +1,6 @@
 {
   "name": "btoon",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Node.js bindings for BTOON: Binary TOON serialization format",
   "main": "index.js",
   "types": "index.d.ts",
@@ -11,6 +11,7 @@
     "btoon_node.cpp",
     "find_btoon_core.js",
     "find_btoon_lib.js",
+    "find_btoon_static.js",
     "prebuilds/",
     "core/include/",
     "core/src/",

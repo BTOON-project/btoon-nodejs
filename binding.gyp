@@ -13,39 +13,32 @@
         ["OS=='mac'", {
           "include_dirs": [
             "<!@(node find_btoon_core.js)",
+            "core/include",
             "../btoon-core/include",
             "/usr/local/include"
           ],
           "libraries": [
-            "-lbtoon_core",
-            "-lz"
-          ],
-          "library_dirs": [
-            "<!@(node find_btoon_lib.js)",
-            "../btoon-core/build",
-            "/usr/local/lib"
+            "-lz",
+            "<!@(node find_btoon_static.js)"
           ],
           "xcode_settings": {
             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "CLANG_CXX_LIBRARY": "libc++",
             "MACOSX_DEPLOYMENT_TARGET": "10.15",
-            "OTHER_CPLUSPLUSFLAGS": ["-std=c++20"]
+            "OTHER_CPLUSPLUSFLAGS": ["-std=c++20"],
+            "OTHER_LDFLAGS": ["-lz"]
           }
         }],
         ["OS=='linux'", {
           "include_dirs": [
             "<!@(node find_btoon_core.js)",
+            "core/include",
             "../btoon-core/include",
             "/usr/local/include"
           ],
           "libraries": [
-            "-lbtoon_core",
-            "-lz"
-          ],
-          "library_dirs": [
-            "<!@(node find_btoon_lib.js)",
-            "../btoon-core/build",
-            "/usr/local/lib"
+            "-lz",
+            "<!@(node find_btoon_static.js)"
           ],
           "cflags_cc": ["-std=c++20", "-fPIC"]
         }],
