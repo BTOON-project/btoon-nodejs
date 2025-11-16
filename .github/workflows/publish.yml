@@ -112,9 +112,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run prebuild:upload
-      
+
       - name: Publish to npm
-        if: github.event_name == 'release' && matrix.os == 'ubuntu-latest' && matrix.node == 20 && github.event.inputs.dry_run != 'true'
+        if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) && matrix.os == 'ubuntu-latest' && matrix.node == 20
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish
