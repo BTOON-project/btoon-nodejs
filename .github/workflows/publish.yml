@@ -94,10 +94,19 @@ jobs:
       
       - name: Run tests
         run: npm test
-      
-      - name: Build prebuilds
-        run: npm run prebuild
-      
+
+      - name: Build prebuilds (Windows)
+        if: matrix.os == 'windows-latest'
+        run: npm run prebuild:win
+
+      - name: Build prebuilds (macOS)
+        if: matrix.os == 'macos-latest'
+        run: npm run prebuild:mac
+
+      - name: Build prebuilds (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run prebuild:linux
+
       - name: Upload prebuilds
         if: github.event_name == 'release'
         env:
