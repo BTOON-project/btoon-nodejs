@@ -6,7 +6,7 @@
 !btoon_node.cpp
 
 # Build configuration
-binding.gyp
+# binding.gyp - NEEDED for source builds when prebuilds aren't available
 .gyp
 
 # Development files
