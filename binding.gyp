@@ -68,7 +68,7 @@
             "VCCLCompilerTool": {
               "ExceptionHandling": 1,
               "RuntimeLibrary": 2,
-              "AdditionalOptions": ["/std:c++20"]
+              "AdditionalOptions": ["/std:c++20", "/MD"]
             }
           }
         }]
