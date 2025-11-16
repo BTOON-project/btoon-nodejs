@@ -108,7 +108,7 @@ jobs:
         run: npm run prebuild:linux
 
       - name: Upload prebuilds
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run prebuild:upload
@@ -117,7 +117,10 @@ jobs:
         if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) && matrix.os == 'ubuntu-latest' && matrix.node == 20
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish
+        run: |
+          # Wait a bit to ensure other jobs have uploaded their prebuilds
+          sleep 30
+          npm publish
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

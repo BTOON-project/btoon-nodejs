@@ -33,7 +33,7 @@
     "prebuild:win": "prebuild --target 18.0.0 --target 20.0.0 --target 22.0.0 --arch x64",
     "prebuild:mac": "prebuild --target 18.0.0 --target 20.0.0 --target 22.0.0 --arch arm64 --arch x64",
     "prebuild:linux": "prebuild --target 18.0.0 --target 20.0.0 --target 22.0.0 --arch x64",
-    "prebuild:upload": "prebuild --upload-all ${GITHUB_TOKEN}",
+    "prebuild:upload": "prebuild --upload ${GITHUB_TOKEN}",
     "prepublishOnly": "npm test && npm run build:release",
     "version": "npm run build:release && git add -A",
     "postversion": "git push && git push --tags"
