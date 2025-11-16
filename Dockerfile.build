@@ -1,0 +1,42 @@
+# Dockerfile for building Linux prebuilt binaries
+FROM node:20-bookworm
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    python3 \
+    git \
+    zlib1g-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy package files
+COPY package*.json ./
+COPY binding.gyp ./
+COPY *.cpp ./
+COPY *.js ./
+COPY index.d.ts ./
+
+# Copy core library
+COPY core/ ./core/
+
+# Install dependencies
+RUN npm install --ignore-scripts
+
+# Build btoon-core first (clean any existing build cache)
+WORKDIR /build/core
+RUN rm -rf build && mkdir -p build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+    make -j$(nproc)
+
+# Build Node.js addon and create prebuilds
+WORKDIR /build
+RUN npx prebuild --target 18.0.0 --target 20.0.0 --target 22.0.0
+
+# Output directory for prebuilds
+CMD ["sh", "-c", "cp -r prebuilds /output/"]
