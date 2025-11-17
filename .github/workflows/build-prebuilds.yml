@@ -7,9 +7,6 @@ on:
         description: 'Release tag (e.g., v0.0.5) - leave empty to skip upload'
         required: false
         default: ''
-  push:
-    tags:
-      - 'v*'
 
 permissions:
   contents: write  # Required for uploading to releases
