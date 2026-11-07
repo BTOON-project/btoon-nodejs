@@ -17,7 +17,7 @@ JavaScript implementation.
 npm install btoon
 ```
 
-Prebuilt binaries (Node-API, Node ≥ 18) ship for Linux x64/arm64 (glibc and musl), macOS
+Prebuilt binaries (Node-API, Node ≥ 18) ship for Linux x64 (glibc and musl), Linux arm64 (glibc), macOS
 arm64/x64 and Windows x64. On other platforms npm builds from source, which needs a C++20
 compiler and Python for node-gyp.
 
