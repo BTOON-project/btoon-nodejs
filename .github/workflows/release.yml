@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Install build tools (Alpine)
         if: matrix.container
-        run: apk add --no-cache build-base python3 git
+        run: apk add --no-cache bash build-base python3 git
       - uses: actions/checkout@v7
         with:
           submodules: recursive
