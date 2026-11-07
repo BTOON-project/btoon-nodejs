@@ -78,10 +78,21 @@ jobs:
       - run: ls -R prebuilds
       - name: Check that the tag matches package.json
         run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
+      - name: Skip if this version is already on npm
+        id: published
+        run: |
+          spec="$(node -p "require('./package.json').name")@${GITHUB_REF_NAME#v}"
+          if npm view "$spec" version >/dev/null 2>&1; then
+            echo "$spec is already on npm; nothing to publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       - run: npm install --ignore-scripts
+        if: steps.published.outputs.skip != 'true'
       # npm >= 11.5.1 uses trusted publishing (OIDC) when it's configured on npmjs.com,
       # and falls back to the NPM_TOKEN secret otherwise.
       - run: npm install -g npm@11
+        if: steps.published.outputs.skip != 'true'
       - run: npm publish --provenance --access public
+        if: steps.published.outputs.skip != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
