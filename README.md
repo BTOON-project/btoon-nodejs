@@ -7,6 +7,12 @@ vectors and optional compression/signing. Built on the C++ reference implementat
 same as [`@btoon/js`](https://github.com/BTOON-project/btoon-javascript), the pure
 JavaScript implementation.
 
+> **Most applications should use [`@btoon/js`](https://www.npmjs.com/package/@btoon/js)
+> instead.** It has the same API and writes the same bytes, and in Node.js it is about 5×
+> faster than this addon (see [Performance](#performance)). Use this package when you
+> want the C++ reference implementation itself, or a source build with Zstd, LZ4, Brotli
+> or Snappy.
+
 ```bash
 npm install btoon
 ```
