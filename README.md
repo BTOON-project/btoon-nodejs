@@ -74,19 +74,21 @@ Every failure throws `BtoonError`, and `err.code` is a spec error code: `truncat
 Size is where BTOON helps. For 10,000 records (`id`, `name`, `email`, `age`, `score`,
 `active`) BTOON is **447 KB**, against 767 KB for MessagePack and 1,018 KB for JSON.
 
-Speed is a different story. Measured on Node 22.22, Apple M4 Max, best of 9:
+Speed is a different story. Measured on Node 22.22, Apple M4 Max, best of 15, same data
+and byte-identical BTOON output:
 
 | | encode | decode |
 |---|---:|---:|
-| `btoon` (native) | 8.8 ms | 8.0 ms |
-| `@msgpack/msgpack` 3.1 (pure JS) | 3.2 ms | 2.8 ms |
-| `JSON` | 1.8 ms | 2.4 ms |
+| `btoon` (this package, native) | 7.8 ms | 7.1 ms |
+| [`@btoon/js`](https://github.com/BTOON-project/btoon-javascript) (pure TypeScript) | 1.1 ms | 1.6 ms |
+| `@msgpack/msgpack` 3.1 (pure JS) | 2.7 ms | 2.5 ms |
+| `JSON` | 1.5 ms | 1.9 ms |
 
-This binding is slower than the fastest pure-JS serializers. Each property access and
-object creation crosses the Node-API boundary, while V8 optimizes pure JS very well. If
-you need throughput on plain JSON-like data, benchmark `@btoon/js` (pure JavaScript, same
-API and same bytes) on your workload. This package is useful when you want the reference C++
-implementation itself, or Zstd/LZ4/Brotli/Snappy envelopes from a build that includes them.
+This binding is the slowest of these. Each property access and object creation crosses
+the Node-API boundary, while V8 optimizes pure JavaScript very well. For throughput, use
+`@btoon/js`: same API, same bytes. This package is useful when you want the reference
+C++ implementation itself, or Zstd/LZ4/Brotli/Snappy envelopes from a build that
+includes them.
 
 ## Interoperability
 
