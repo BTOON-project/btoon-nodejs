@@ -6,7 +6,7 @@ The API mirrors `@btoon/js` (btoon-javascript), so keep the two in sync.
 ## Commands
 
 ```bash
-npm install --ignore-scripts && npx node-gyp rebuild && npm test   # node --test test/*.test.js
+npm install --ignore-scripts && npx node-gyp rebuild && npm test   # node --test on test/api.test.js and test/vectors.test.js
 npm run examples
 ```
 

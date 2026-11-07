@@ -110,7 +110,9 @@ test('lone surrogates are invalid_utf8, like @btoon/js', () => {
   for (const s of ['\ufffd', 'a\ud83d\ude00b', '\ud83d\ude00\ufffd', '\ufffd'.repeat(3000)]) {
     assert.equal(btoon.decode(btoon.encode(s)), s);
   }
-  assert.equal(btoon.decode(btoon.encode('a\ud800b'.toWellFormed())), 'a\ufffdb');
+  if (typeof String.prototype.toWellFormed === 'function') {
+    assert.equal(btoon.decode(btoon.encode('a\ud800b'.toWellFormed())), 'a\ufffdb');
+  }
 });
 
 test('__proto__ keys stay own properties', () => {

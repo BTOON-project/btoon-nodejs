@@ -31,7 +31,7 @@
     "install": "node-gyp-build",
     "build": "node-gyp rebuild",
     "prebuilds": "prebuildify --napi --strip --target 18.0.0",
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/api.test.js test/vectors.test.js",
     "examples": "node examples/01-basic.js && node examples/02-compression.js && node examples/03-tabular.js && node examples/04-streaming.js"
   },
   "repository": {

@@ -26,10 +26,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # Build with the current LTS (node-gyp 13 needs Node >= 22.22), then test the
+      # same Node-API binary on every supported version, as the prebuilds are used.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts
+      - run: npx node-gyp rebuild
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
-      - run: npm install --ignore-scripts
-      - run: npx node-gyp rebuild
-      - run: npm test
+      - run: node --version && npm test
       - run: npm run examples
