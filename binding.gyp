@@ -2,66 +2,36 @@
   "targets": [
     {
       "target_name": "btoon",
-      "sources": ["btoon_node.cpp"],
-      "include_dirs": [
-        "node_modules/node-addon-api"
+      "sources": [
+        "src/btoon_node.cpp",
+        "<!@(node scripts/core-path.js sources)"
       ],
-      "cflags!": ["-fno-exceptions"],
-      "cflags_cc!": ["-fno-exceptions"],
-      "cflags_cc": ["-std=c++20"],
+      "include_dirs": [
+        "<!(node -p \"require('node-addon-api').include_dir\")",
+        "<!(node scripts/core-path.js include)",
+        "<!(node scripts/core-path.js src)"
+      ],
+      "defines": ["NAPI_VERSION=8", "NAPI_CPP_EXCEPTIONS"],
+      "cflags_cc!": ["-fno-exceptions", "-fno-rtti", "-std=gnu++17", "-std=c++17"],
+      "cflags_cc": ["-std=c++20", "-fexceptions", "-frtti", "-O3"],
       "conditions": [
         ["OS=='mac'", {
-          "include_dirs": [
-            "<!@(node find_btoon_core.js)",
-            "core/include",
-            "../btoon-core/include",
-            "/usr/local/include"
-          ],
-          "libraries": [
-            "-lz",
-            "<!@(node find_btoon_static.js)"
-          ],
           "xcode_settings": {
-            "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
+            "CLANG_CXX_LANGUAGE_STANDARD": "c++20",
             "CLANG_CXX_LIBRARY": "libc++",
-            "MACOSX_DEPLOYMENT_TARGET": "10.15",
-            "OTHER_CPLUSPLUSFLAGS": ["-std=c++20"],
-            "OTHER_LDFLAGS": ["-lz"]
+            "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
+            "GCC_ENABLE_CPP_RTTI": "YES",
+            "GCC_OPTIMIZATION_LEVEL": "3",
+            "MACOSX_DEPLOYMENT_TARGET": "11.0"
           }
         }],
-        ["OS=='linux'", {
-          "include_dirs": [
-            "<!@(node find_btoon_core.js)",
-            "core/include",
-            "../btoon-core/include",
-            "/usr/local/include"
-          ],
-          "libraries": [
-            "-lz",
-            "<!@(node find_btoon_static.js)"
-          ],
-          "cflags_cc": ["-std=c++20", "-fPIC"]
-        }],
         ["OS=='win'", {
-          "include_dirs": [
-            "core/include",
-            "core/build/Release",
-            "C:/vcpkg/installed/x64-windows/include"
-          ],
-          "library_dirs": [
-            "core/build/Release",
-            "C:/vcpkg/installed/x64-windows/lib"
-          ],
-          "libraries": [
-            "btoon_core.lib",
-            "zlib.lib",
-            "ws2_32.lib"
-          ],
+          "defines": ["NOMINMAX", "WIN32_LEAN_AND_MEAN", "_HAS_EXCEPTIONS=1"],
           "msvs_settings": {
             "VCCLCompilerTool": {
+              "AdditionalOptions": ["/std:c++20", "/EHsc", "/Zc:__cplusplus", "/permissive-"],
               "ExceptionHandling": 1,
-              "RuntimeLibrary": 2,
-              "AdditionalOptions": ["/std:c++20", "/MD"]
+              "RuntimeTypeInfo": "true"
             }
           }
         }]

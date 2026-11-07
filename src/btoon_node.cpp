@@ -1,0 +1,783 @@
+// SPDX-FileCopyrightText: 2025 Alvar Laigna <https://alvarlaigna.com>
+// SPDX-License-Identifier: MIT
+//
+// Node-API addon for BTOON. JS values are encoded straight into btoon::Encoder
+// (no intermediate tree); bytes are decoded by btoon-core's hardened decoder
+// into a btoon::Value and then converted to JS. The JS-facing classes
+// (BtoonError, Ext, Timestamp) are defined in index.js and passed to setup().
+#include <napi.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include "btoon/btoon.h"
+#include "btoon/encoder.h"
+
+using namespace btoon;
+
+namespace {
+
+struct AddonData {
+    Napi::FunctionReference BtoonError, Ext, Timestamp, MapCtor, ArrayFrom;
+    Napi::ObjectReference ObjectPrototype;
+};
+
+AddonData* data_of(Napi::Env env) {
+    auto* d = env.GetInstanceData<AddonData>();
+    if (!d) throw Napi::Error::New(env, "btoon: native module not initialized (call setup first)");
+    return d;
+}
+
+// A JS exception carrying a spec error code: new BtoonError(code, message).
+[[noreturn]] void throw_btoon(Napi::Env env, const char* code, const std::string& message) {
+    Napi::Value err = data_of(env)->BtoonError.New({Napi::String::New(env, code), Napi::String::New(env, message)});
+    throw Napi::Error(env, err);
+}
+
+// --- JS -> bytes ------------------------------------------------------------------------
+
+struct Entry {
+    std::string key;     // UTF-8
+    Napi::Value value;
+};
+using Entries = std::vector<Entry>;
+
+class JsEncoder {
+public:
+    JsEncoder(Napi::Env env, Encoder& enc, size_t max_depth, bool tabular)
+        : env_(env), enc_(enc), max_depth_(max_depth), tabular_(tabular), d_(data_of(env)) {}
+
+    void encode(Napi::Value v, size_t depth) {
+        switch (v.Type()) {
+            case napi_undefined:
+            case napi_null: return enc_.encodeNil();
+            case napi_boolean: return enc_.encodeBool(v.As<Napi::Boolean>().Value());
+            case napi_number: return encode_number(v.As<Napi::Number>().DoubleValue());
+            case napi_bigint: return encode_bigint(v.As<Napi::BigInt>());
+            case napi_string: return enc_.encodeString(utf8(v));
+            case napi_object: return encode_object(v.As<Napi::Object>(), depth);
+            default:
+                throw_btoon(env_, "invalid_argument",
+                            std::string("cannot encode a value of type ") + type_name(v.Type()));
+        }
+    }
+
+private:
+    static const char* type_name(napi_valuetype t) {
+        switch (t) {
+            case napi_function: return "function";
+            case napi_symbol: return "symbol";
+            case napi_external: return "external";
+            default: return "unknown";
+        }
+    }
+
+    void check_depth(size_t depth) {
+        if (depth >= max_depth_) throw_btoon(env_, "max_depth", "maximum nesting depth exceeded (or the value contains a cycle)");
+    }
+
+    // One call in the common case: a truncated copy leaves at most 3 bytes (a split UTF-8
+    // sequence) plus the terminator unused, so more free space than that proves completeness.
+    std::string_view utf8(Napi::Value s) {
+        if (scratch_.size() < 4096) scratch_.resize(4096);
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env_, s, scratch_.data(), scratch_.size(), &len) != napi_ok) {
+            throw Napi::Error::New(env_, "btoon: failed to read string");
+        }
+        if (len + 5 > scratch_.size()) {
+            napi_get_value_string_utf8(env_, s, nullptr, 0, &len);
+            scratch_.resize(len + 1);
+            napi_get_value_string_utf8(env_, s, scratch_.data(), len + 1, &len);
+        }
+        std::string_view out{scratch_.data(), len};
+        check_well_formed(s, out);
+        return out;
+    }
+
+    // A lone surrogate has no UTF-8 form, and napi_get_value_string_utf8 silently turns it
+    // into U+FFFD. Like @btoon/js, reject it instead. Only strings whose UTF-8 contains
+    // U+FFFD (EF BF BD) need the UTF-16 check, so the common path stays one scan.
+    void check_well_formed(Napi::Value s, std::string_view u8) {
+        if (u8.find("\xEF\xBF\xBD") == std::string_view::npos) return;
+        size_t n = 0;
+        napi_get_value_string_utf16(env_, s, nullptr, 0, &n);
+        std::u16string u16(n + 1, u'\0');
+        napi_get_value_string_utf16(env_, s, u16.data(), n + 1, &n);
+        for (size_t i = 0; i < n; ++i) {
+            const char16_t c = u16[i];
+            if (c < 0xD800 || c > 0xDFFF) continue;
+            if (c <= 0xDBFF && i + 1 < n && u16[i + 1] >= 0xDC00 && u16[i + 1] <= 0xDFFF) {
+                ++i;
+                continue;
+            }
+            throw_btoon(env_, "invalid_utf8", "string contains a lone surrogate (use String.prototype.toWellFormed())");
+        }
+    }
+
+    std::string utf8_copy(Napi::Value s) { return std::string(utf8(s)); }
+
+    void encode_number(double d) {
+        // Safe integers are integers; everything else (including -0) is float64.
+        if (std::isfinite(d) && d == std::trunc(d) && std::fabs(d) <= 9007199254740991.0 && !(d == 0 && std::signbit(d))) {
+            return enc_.encodeInt(static_cast<int64_t>(d));
+        }
+        enc_.encodeFloat(d);
+    }
+
+    void encode_bigint(Napi::BigInt b) {
+        bool lossless = false;
+        int64_t i = b.Int64Value(&lossless);
+        if (lossless) return enc_.encodeInt(i);
+        uint64_t u = b.Uint64Value(&lossless);
+        if (lossless) return enc_.encodeUint(u);
+        // Arbitrary precision -> two's complement big-endian (SPEC §5.4).
+        int sign = 0;
+        size_t count = b.WordCount();
+        std::vector<uint64_t> words(count);
+        b.ToWords(&sign, &count, words.data());
+        std::vector<uint8_t> mag;  // big-endian magnitude
+        for (size_t w = count; w-- > 0;) {
+            for (int k = 7; k >= 0; --k) mag.push_back(static_cast<uint8_t>(words[w] >> (8 * k)));
+        }
+        mag.insert(mag.begin(), 0);  // room for the sign bit
+        if (sign) {
+            for (auto& x : mag) x = static_cast<uint8_t>(~x);
+            for (size_t j = mag.size(); j-- > 0;) {
+                if (++mag[j] != 0) break;
+            }
+        }
+        enc_.encodeBigInt(mag);  // normalizes to minimal length
+    }
+
+    bool instance_of(Napi::Object o, Napi::FunctionReference& ctor) {
+        bool result = false;
+        napi_instanceof(env_, o, ctor.Value(), &result);
+        return result;
+    }
+
+    // If `v` encodes as a BTOON map, returns its entries sorted by UTF-8 key bytes.
+    // Calls toJSON() at most once and stores the replacement in `*replaced`.
+    // Plain objects ({} literals, Object.create(null)) skip the exotic-type checks entirely.
+    bool is_plain(Napi::Object o) {
+        napi_value proto;
+        if (napi_get_prototype(env_, o, &proto) != napi_ok) return false;
+        napi_valuetype t;
+        napi_typeof(env_, proto, &t);
+        if (t == napi_null) return true;
+        bool eq = false;
+        napi_strict_equals(env_, proto, d_->ObjectPrototype.Value(), &eq);
+        return eq;
+    }
+
+    Entries own_entries(Napi::Object o) {
+        napi_value names;
+        if (napi_get_all_property_names(env_, o, napi_key_own_only,
+                                        static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                                        napi_key_numbers_to_strings, &names) != napi_ok) {
+            throw Napi::Error::New(env_, "btoon: failed to enumerate object properties");
+        }
+        uint32_t n = 0;
+        napi_get_array_length(env_, names, &n);
+        Entries out;
+        out.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value k, val;
+            napi_get_element(env_, names, i, &k);
+            napi_get_property(env_, o, k, &val);
+            out.push_back({utf8_copy(Napi::Value(env_, k)), Napi::Value(env_, val)});
+        }
+        sort(out);
+        return out;
+    }
+
+    std::optional<Entries> map_entries(Napi::Value v, Napi::Value* replaced) {
+        if (!v.IsObject()) return std::nullopt;
+        Napi::Object o = v.As<Napi::Object>();
+        if (o.IsArray()) return std::nullopt;
+        if (is_plain(o)) {
+            bool has_to_json = false;
+            napi_value key = Napi::String::New(env_, "toJSON");
+            napi_has_own_property(env_, o, key, &has_to_json);
+            if (has_to_json) {
+                Napi::Value fn = o.Get(key);
+                if (fn.IsFunction()) {
+                    *replaced = fn.As<Napi::Function>().Call(o, {});
+                    return std::nullopt;
+                }
+            }
+            return own_entries(o);
+        }
+        if (o.IsTypedArray() || o.IsArrayBuffer() || o.IsDataView() || o.IsDate() ||
+            instance_of(o, d_->Ext) || instance_of(o, d_->Timestamp)) {
+            return std::nullopt;
+        }
+        if (instance_of(o, d_->MapCtor)) {
+            Napi::Array pairs = d_->ArrayFrom.Call({o}).As<Napi::Array>();
+            Entries out;
+            out.reserve(pairs.Length());
+            for (uint32_t i = 0; i < pairs.Length(); ++i) {
+                Napi::Array kv = pairs.Get(i).As<Napi::Array>();
+                Napi::Value k = kv.Get(uint32_t(0));
+                if (!k.IsString()) throw_btoon(env_, "invalid_argument", "Map keys must be strings");
+                out.push_back({utf8_copy(k), kv.Get(uint32_t(1))});
+            }
+            sort(out);
+            return out;
+        }
+        Napi::Value to_json = o.Get("toJSON");
+        if (to_json.IsFunction()) {
+            *replaced = to_json.As<Napi::Function>().Call(o, {});
+            return std::nullopt;
+        }
+        return own_entries(o);
+    }
+
+    static void sort(Entries& e) {
+        std::sort(e.begin(), e.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
+    }
+
+    void encode_entries(const Entries& entries, size_t depth) {
+        check_depth(depth);
+        enc_.encodeMapHeader(entries.size());
+        for (const Entry& e : entries) {
+            enc_.encodeString(e.key);
+            encode(e.value, depth + 1);
+        }
+    }
+
+    void encode_bytes(Napi::Object o) {
+        if (o.IsTypedArray()) {
+            Napi::TypedArray ta = o.As<Napi::TypedArray>();
+            napi_typedarray_type type = ta.TypedArrayType();
+            const uint8_t* base = static_cast<const uint8_t*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+            if (type == napi_float32_array) {
+                return encode_vector<float>(base, ta.ElementLength());
+            }
+            if (type == napi_float64_array) {
+                return encode_vector<double>(base, ta.ElementLength());
+            }
+            return enc_.encodeBinary({base, ta.ByteLength()});
+        }
+        if (o.IsDataView()) {
+            Napi::DataView dv = o.As<Napi::DataView>();
+            const auto* base = static_cast<const uint8_t*>(dv.ArrayBuffer().Data()) + dv.ByteOffset();
+            return enc_.encodeBinary({base, dv.ByteLength()});
+        }
+        Napi::ArrayBuffer ab = o.As<Napi::ArrayBuffer>();
+        enc_.encodeBinary({static_cast<const uint8_t*>(ab.Data()), ab.ByteLength()});
+    }
+
+    template <class T>
+    void encode_vector(const uint8_t* bytes, size_t count) {
+        // Copy out: the typed array may be unaligned within its buffer.
+        std::vector<T> tmp(count);
+        if (count) std::memcpy(tmp.data(), bytes, count * sizeof(T));
+        if constexpr (sizeof(T) == 4) {
+            enc_.encodeVectorFloat(std::span<const float>(tmp));
+        } else {
+            enc_.encodeVectorDouble(std::span<const double>(tmp));
+        }
+    }
+
+    void encode_object(Napi::Object o, size_t depth) {
+        if (o.IsArray()) return encode_array(o.As<Napi::Array>(), depth);
+        if (is_plain(o)) {
+            Napi::Value replaced;
+            auto entries = map_entries(o, &replaced);
+            if (entries) return encode_entries(*entries, depth);
+            check_depth(depth);
+            return encode(replaced, depth + 1);
+        }
+        if (o.IsTypedArray() || o.IsArrayBuffer() || o.IsDataView()) return encode_bytes(o);
+        if (o.IsDate()) {
+            double ms = o.As<Napi::Date>().ValueOf();
+            if (!std::isfinite(ms)) throw_btoon(env_, "invalid_argument", "cannot encode an invalid Date");
+            return enc_.encodeTimestamp(Timestamp::from_milliseconds(static_cast<int64_t>(ms)));
+        }
+        if (instance_of(o, d_->Ext)) {
+            int type = o.Get("type").As<Napi::Number>().Int32Value();
+            Napi::TypedArray bytes = o.Get("data").As<Napi::TypedArray>();
+            const auto* base = static_cast<const uint8_t*>(bytes.ArrayBuffer().Data()) + bytes.ByteOffset();
+            return enc_.encodeExtension(static_cast<int8_t>(type), {base, bytes.ByteLength()});
+        }
+        if (instance_of(o, d_->Timestamp)) {
+            bool lossless = false;
+            int64_t secs = o.Get("seconds").As<Napi::BigInt>().Int64Value(&lossless);
+            auto nanos = static_cast<uint32_t>(o.Get("nanoseconds").As<Napi::Number>().Uint32Value());
+            Napi::Value off = o.Get("offsetMinutes");
+            if (off.IsUndefined() || off.IsNull()) return enc_.encodeTimestamp(Timestamp(secs, nanos));
+            return enc_.encodeTimestamp(Timestamp(secs, nanos, static_cast<int16_t>(off.As<Napi::Number>().Int32Value())));
+        }
+        Napi::Value replaced;
+        auto entries = map_entries(o, &replaced);
+        if (entries) return encode_entries(*entries, depth);
+        if (replaced.IsEmpty()) throw_btoon(env_, "invalid_argument", "cannot encode this object");
+        check_depth(depth);  // toJSON() chains terminate
+        encode(replaced, depth + 1);
+    }
+
+    void encode_array(Napi::Array arr, size_t depth) {
+        check_depth(depth);
+        const uint32_t n = arr.Length();
+        std::vector<Napi::Value> items;
+        items.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) items.push_back(arr.Get(i));
+        if (tabular_ && n >= 2 && try_tabular(items, depth)) return;
+        enc_.encodeArrayHeader(n);
+        for (const auto& item : items) encode(item, depth + 1);
+    }
+
+    // SPEC §5.6.2: ≥ 2 rows, all maps (plain objects, class instances, Maps), same non-empty key set,
+    // and the size rule. Entries are computed once and reused, so getters/toJSON run exactly once.
+    bool try_tabular(std::vector<Napi::Value>& items, size_t depth) {
+        std::vector<Entries> rows;
+        rows.reserve(items.size());
+        for (size_t r = 0; r < items.size(); ++r) {
+            Napi::Value replaced;
+            auto entries = map_entries(items[r], &replaced);
+            if (!replaced.IsEmpty()) {
+                // toJSON() ran once; its result is what gets encoded (and may itself be a map).
+                items[r] = replaced;
+                Napi::Value again;
+                entries = map_entries(replaced, &again);
+                if (!again.IsEmpty()) {
+                    items[r] = again;
+                    return finish_plain(items, rows, depth);
+                }
+            }
+            if (!entries || entries->empty()) return finish_plain(items, rows, depth);
+            if (r > 0) {
+                const Entries& first = rows[0];
+                bool same = entries->size() == first.size();
+                for (size_t k = 0; same && k < first.size(); ++k) same = (*entries)[k].key == first[k].key;
+                if (!same) {
+                    rows.push_back(std::move(*entries));
+                    return finish_plain(items, rows, depth);
+                }
+            }
+            rows.push_back(std::move(*entries));
+        }
+        std::vector<size_t> lengths;
+        std::vector<std::string_view> names;
+        for (const Entry& e : rows[0]) {
+            lengths.push_back(e.key.size());
+            names.push_back(e.key);
+        }
+        if (!btoon::tabular_beneficial(rows.size(), lengths)) return finish_plain(items, rows, depth);
+        if (depth + 1 >= max_depth_) throw_btoon(env_, "max_depth", "maximum nesting depth exceeded (or the value contains a cycle)");
+        enc_.beginTabular(names, rows.size());
+        for (size_t c = 0; c < names.size(); ++c) {
+            enc_.beginTabularColumn();
+            for (const Entries& row : rows) encode(row[c].value, depth + 2);
+            enc_.endTabularColumn();
+        }
+        enc_.endTabular();
+        return true;
+    }
+
+    // Plain array, reusing whatever map entries were already computed (no second getter/toJSON call).
+    bool finish_plain(std::vector<Napi::Value>& items, std::vector<Entries>& rows, size_t depth) {
+        enc_.encodeArrayHeader(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (i < rows.size()) {
+                encode_entries(rows[i], depth + 1);
+            } else {
+                encode(items[i], depth + 1);
+            }
+        }
+        return true;
+    }
+
+    Napi::Env env_;
+    Encoder& enc_;
+    size_t max_depth_;
+    bool tabular_;
+    AddonData* d_;
+    std::string scratch_;
+};
+
+// --- bytes -> JS ----------------------------------------------------------------------------
+
+struct DecodeCtx {
+    Napi::Env env;
+    AddonData* d;
+    bool timestamps_as_objects;
+    bool bigint_always;
+    std::unordered_map<std::string_view, Napi::Value> keys;  // repeated keys share one JS string
+};
+
+Napi::Value int_to_js(DecodeCtx& c, int64_t v) {
+    if (!c.bigint_always && v >= -9007199254740991LL && v <= 9007199254740991LL) {
+        return Napi::Number::New(c.env, static_cast<double>(v));
+    }
+    return Napi::BigInt::New(c.env, v);
+}
+
+Napi::Value bigint_to_js(DecodeCtx& c, const std::vector<uint8_t>& twos) {
+    // A bigint extension holding a 64-bit value (non-canonical, but valid) is still just an
+    // integer: give it the same JS type the canonical encoding would get.
+    BigInt as_big{twos};
+    std::vector<uint8_t> minimal = as_big.minimal_bytes();
+    if (minimal.size() <= 8) {
+        uint64_t v = (minimal[0] & 0x80) ? ~uint64_t(0) : 0;
+        for (uint8_t byte : minimal) v = (v << 8) | byte;
+        return int_to_js(c, static_cast<int64_t>(v));
+    }
+    std::vector<uint8_t> b = twos;
+    bool negative = !b.empty() && (b[0] & 0x80);
+    if (negative) {  // magnitude = -value
+        for (auto& x : b) x = static_cast<uint8_t>(~x);
+        for (size_t j = b.size(); j-- > 0;) {
+            if (++b[j] != 0) break;
+        }
+    }
+    std::vector<uint64_t> words((b.size() + 7) / 8, 0);
+    for (size_t i = 0; i < b.size(); ++i) {
+        size_t bit = (b.size() - 1 - i) * 8;
+        words[bit / 64] |= uint64_t(b[i]) << (bit % 64);
+    }
+    if (words.empty()) words.push_back(0);
+    return Napi::BigInt::New(c.env, negative ? 1 : 0, words.size(), words.data());
+}
+
+Napi::Value instant_to_js(DecodeCtx& c, int64_t seconds, uint32_t nanos, std::optional<int16_t> offset) {
+    if (c.timestamps_as_objects) {
+        Napi::Value off = offset ? Napi::Value(Napi::Number::New(c.env, *offset)) : c.env.Undefined();
+        return c.d->Timestamp.New({Napi::BigInt::New(c.env, seconds), Napi::Number::New(c.env, nanos), off});
+    }
+    double ms = static_cast<double>(seconds) * 1000.0 + std::floor(static_cast<double>(nanos) / 1e6);
+    return Napi::Date::New(c.env, ms);
+}
+
+template <class T>
+Napi::Value vector_to_js(DecodeCtx& c, const std::vector<T>& v) {
+    Napi::ArrayBuffer ab = Napi::ArrayBuffer::New(c.env, v.size() * sizeof(T));
+    if (!v.empty()) std::memcpy(ab.Data(), v.data(), v.size() * sizeof(T));
+    if constexpr (sizeof(T) == 4) {
+        return Napi::Float32Array::New(c.env, v.size(), ab, 0);
+    } else {
+        return Napi::Float64Array::New(c.env, v.size(), ab, 0);
+    }
+}
+
+Napi::Value to_js(DecodeCtx& c, const Value& v) {
+    switch (v.index()) {
+        case 0: return c.env.Null();
+        case 1: return Napi::Boolean::New(c.env, std::get<Bool>(v));
+        case 2: return int_to_js(c, std::get<Int>(v));
+        case 3: return Napi::BigInt::New(c.env, std::get<Uint>(v));
+        case 4: return Napi::Number::New(c.env, std::get<Float>(v));
+        case 5: {
+            const auto& s = std::get<String>(v);
+            return Napi::String::New(c.env, s.data(), s.size());
+        }
+        case 6: {
+            const auto& b = std::get<Binary>(v);
+            return Napi::Buffer<uint8_t>::Copy(c.env, b.data(), b.size());
+        }
+        case 7: {
+            const auto& a = std::get<Array>(v);
+            Napi::Array out = Napi::Array::New(c.env, a.size());
+            for (size_t i = 0; i < a.size(); ++i) out.Set(static_cast<uint32_t>(i), to_js(c, a[i]));
+            return out;
+        }
+        case 8: {
+            // One napi_define_properties call per object. Defining (not assigning) also makes a
+            // "__proto__" key an own property instead of changing the prototype.
+            const auto& m = std::get<Map>(v);
+            std::vector<napi_property_descriptor> props(m.size());
+            size_t i = 0;
+            for (const auto& [k, e] : m) {
+                napi_value key;
+                auto it = c.keys.find(k);
+                if (it != c.keys.end()) {
+                    key = it->second;
+                } else {
+                    key = Napi::String::New(c.env, k.data(), k.size());
+                    if (c.keys.size() < 8192) c.keys.emplace(std::string_view(k), Napi::Value(c.env, key));
+                }
+                props[i++] = {nullptr, key, nullptr, nullptr, nullptr, to_js(c, e), napi_default_jsproperty, nullptr};
+            }
+            napi_value out;
+            napi_create_object(c.env, &out);
+            if (!props.empty() && napi_define_properties(c.env, out, props.size(), props.data()) != napi_ok) {
+                throw Napi::Error::New(c.env, "btoon: failed to build object");
+            }
+            return Napi::Value(c.env, out);
+        }
+        case 9: {
+            const auto& e = std::get<Extension>(v);
+            return c.d->Ext.New({Napi::Number::New(c.env, e.type),
+                                 Napi::Buffer<uint8_t>::Copy(c.env, e.data.data(), e.data.size())});
+        }
+        case 10: {
+            const auto& ts = std::get<Timestamp>(v);
+            std::optional<int16_t> off;
+            if (ts.has_timezone) off = ts.timezone_offset;
+            return instant_to_js(c, ts.seconds, ts.nanoseconds, off);
+        }
+        case 11: {
+            int64_t ms = std::get<Date>(v).milliseconds;
+            int64_t s = ms / 1000, r = ms % 1000;
+            if (r < 0) { r += 1000; --s; }
+            return instant_to_js(c, s, static_cast<uint32_t>(r * 1000000), std::nullopt);
+        }
+        case 12: {
+            int64_t ns = std::get<DateTime>(v).nanoseconds;
+            int64_t s = ns / 1000000000, r = ns % 1000000000;
+            if (r < 0) { r += 1000000000; --s; }
+            return instant_to_js(c, s, static_cast<uint32_t>(r), std::nullopt);
+        }
+        case 13: return bigint_to_js(c, std::get<BigInt>(v).bytes);
+        case 14: return vector_to_js(c, std::get<VectorFloat>(v).data);
+        case 15: return vector_to_js(c, std::get<VectorDouble>(v).data);
+    }
+    return c.env.Undefined();
+}
+
+// --- options -------------------------------------------------------------------------------
+
+CompressionAlgorithm parse_algorithm(Napi::Env env, const std::string& name) {
+    if (name == "zlib") return CompressionAlgorithm::ZLIB;
+    if (name == "lz4") return CompressionAlgorithm::LZ4;
+    if (name == "zstd") return CompressionAlgorithm::ZSTD;
+    if (name == "brotli") return CompressionAlgorithm::BROTLI;
+    if (name == "snappy") return CompressionAlgorithm::SNAPPY;
+    if (name == "auto") return CompressionAlgorithm::AUTO;
+    throw_btoon(env, "invalid_argument", "unknown compression algorithm: '" + name + "'");
+}
+
+std::string bytes_option(Napi::Value v) {
+    if (v.IsUndefined() || v.IsNull()) return {};
+    Napi::TypedArray ta = v.As<Napi::TypedArray>();
+    const auto* base = static_cast<const char*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+    return std::string(base, ta.ByteLength());
+}
+
+EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
+    EncodeOptions opts;
+    opts.compress = o.Get("compress").ToBoolean().Value();
+    opts.compression_algorithm = parse_algorithm(env, o.Get("compression").As<Napi::String>().Utf8Value());
+    opts.auto_tabular = o.Get("autoTabular").ToBoolean().Value();
+    opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
+    opts.hmac_key = bytes_option(o.Get("hmacKey"));
+    opts.validate_utf8 = false;  // N-API strings are always well-formed UTF-8
+    return opts;
+}
+
+DecodeOptions decode_options(Napi::Object o) {
+    DecodeOptions opts;
+    opts.strict = o.Get("strict").ToBoolean().Value();
+    opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
+    opts.max_decompressed_size = static_cast<size_t>(o.Get("maxDecompressedSize").As<Napi::Number>().Int64Value());
+    opts.auto_decompress = o.Get("autoDecompress").ToBoolean().Value();
+    opts.hmac_key = bytes_option(o.Get("hmacKey"));
+    return opts;
+}
+
+std::vector<uint8_t> encode_bare(Napi::Env env, Napi::Value value, const EncodeOptions& opts) {
+    Encoder enc(opts);
+    JsEncoder walker(env, enc, opts.max_depth, opts.auto_tabular);
+    try {
+        walker.encode(value, 0);
+        return enc.release();
+    } catch (const BtoonException& e) {
+        throw_btoon(env, e.code_name(), e.what());
+    }
+}
+
+std::span<const uint8_t> input_bytes(Napi::Env env, Napi::Value v) {
+    if (v.IsTypedArray()) {
+        Napi::TypedArray ta = v.As<Napi::TypedArray>();
+        return {static_cast<const uint8_t*>(ta.ArrayBuffer().Data()) + ta.ByteOffset(), ta.ByteLength()};
+    }
+    if (v.IsArrayBuffer()) {
+        Napi::ArrayBuffer ab = v.As<Napi::ArrayBuffer>();
+        return {static_cast<const uint8_t*>(ab.Data()), ab.ByteLength()};
+    }
+    if (v.IsDataView()) {
+        Napi::DataView dv = v.As<Napi::DataView>();
+        return {static_cast<const uint8_t*>(dv.ArrayBuffer().Data()) + dv.ByteOffset(), dv.ByteLength()};
+    }
+    throw_btoon(env, "invalid_argument", "decode expects a Uint8Array, Buffer, ArrayBuffer or DataView");
+}
+
+// --- entry points ---------------------------------------------------------------------------
+
+// Napi::Error propagates to JS by itself; anything else (e.g. std::bad_alloc) must not
+// escape into Node-API, where it would terminate the process.
+template <Napi::Value (*F)(const Napi::CallbackInfo&)>
+Napi::Value guarded(const Napi::CallbackInfo& info) {
+    try {
+        return F(info);
+    } catch (const Napi::Error&) {
+        throw;
+    } catch (const BtoonException& e) {
+        throw_btoon(info.Env(), e.code_name(), e.what());
+    } catch (const std::exception& e) {
+        throw Napi::Error::New(info.Env(), std::string("btoon: ") + e.what());
+    }
+}
+
+Napi::Value Encode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EncodeOptions opts = encode_options(env, info[1].As<Napi::Object>());
+    std::vector<uint8_t> out = encode_bare(env, info[0], opts);
+    if (opts.compress || !opts.hmac_key.empty()) {
+        try {
+            out = btoon::apply_envelopes(std::move(out), opts);
+        } catch (const BtoonException& e) {
+            throw_btoon(env, e.code_name(), e.what());
+        }
+    }
+    return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
+}
+
+DecodeCtx make_ctx(Napi::Env env, Napi::Object o) {
+    return DecodeCtx{env, data_of(env), o.Get("timestamps").As<Napi::String>().Utf8Value() == "object",
+                     o.Get("bigint").As<Napi::String>().Utf8Value() == "always", {}};
+}
+
+Napi::Value Decode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object o = info[1].As<Napi::Object>();
+    DecodeOptions opts = decode_options(o);
+    std::span<const uint8_t> in = input_bytes(env, info[0]);
+    Value value;
+    try {
+        value = btoon::decode(in, opts);
+    } catch (const BtoonException& e) {
+        throw_btoon(env, e.code_name(), e.what());
+    }
+    DecodeCtx ctx = make_ctx(env, o);
+    return to_js(ctx, value);
+}
+
+// decodeAsync: parse on the libuv thread pool, convert on the main thread.
+class DecodeWorker : public Napi::AsyncWorker {
+public:
+    DecodeWorker(Napi::Env env, std::vector<uint8_t> input, DecodeOptions opts, Napi::Object js_opts)
+        : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)), input_(std::move(input)),
+          opts_(std::move(opts)), js_opts_(Napi::Persistent(js_opts)) {}
+    Napi::Promise Promise() { return deferred_.Promise(); }
+
+    void Execute() override {
+        try {
+            value_ = btoon::decode(input_, opts_);
+        } catch (const BtoonException& e) {
+            code_ = e.code_name();
+            SetError(e.what());
+        }
+    }
+    void OnOK() override {
+        Napi::Env env = Env();
+        try {
+            DecodeCtx ctx = make_ctx(env, js_opts_.Value());
+            deferred_.Resolve(to_js(ctx, value_));
+        } catch (const Napi::Error& e) {
+            deferred_.Reject(e.Value());
+        }
+    }
+    void OnError(const Napi::Error& e) override {
+        Napi::Env env = Env();
+        deferred_.Reject(data_of(env)->BtoonError.New({Napi::String::New(env, code_), e.Value().Get("message")}));
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    std::vector<uint8_t> input_;
+    DecodeOptions opts_;
+    Napi::ObjectReference js_opts_;
+    Value value_;
+    std::string code_ = "error";
+};
+
+Napi::Value DecodeAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object o = info[1].As<Napi::Object>();
+    std::span<const uint8_t> in = input_bytes(env, info[0]);
+    // Copy: the caller may mutate their buffer while we work off-thread.
+    auto* worker = new DecodeWorker(env, std::vector<uint8_t>(in.begin(), in.end()), decode_options(o), o);
+    Napi::Promise p = worker->Promise();
+    worker->Queue();
+    return p;
+}
+
+// encodeAsync: the value walk must run on the main thread; envelopes run off-thread.
+class EnvelopeWorker : public Napi::AsyncWorker {
+public:
+    EnvelopeWorker(Napi::Env env, std::vector<uint8_t> bare, EncodeOptions opts)
+        : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)), bytes_(std::move(bare)),
+          opts_(std::move(opts)) {}
+    Napi::Promise Promise() { return deferred_.Promise(); }
+    void Execute() override {
+        try {
+            bytes_ = btoon::apply_envelopes(std::move(bytes_), opts_);
+        } catch (const BtoonException& e) {
+            code_ = e.code_name();
+            SetError(e.what());
+        }
+    }
+    void OnOK() override { deferred_.Resolve(Napi::Buffer<uint8_t>::Copy(Env(), bytes_.data(), bytes_.size())); }
+    void OnError(const Napi::Error& e) override {
+        Napi::Env env = Env();
+        deferred_.Reject(data_of(env)->BtoonError.New({Napi::String::New(env, code_), e.Value().Get("message")}));
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    std::vector<uint8_t> bytes_;
+    EncodeOptions opts_;
+    std::string code_ = "error";
+};
+
+Napi::Value EncodeAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EncodeOptions opts = encode_options(env, info[1].As<Napi::Object>());
+    std::vector<uint8_t> bare = encode_bare(env, info[0], opts);
+    auto* worker = new EnvelopeWorker(env, std::move(bare), opts);
+    Napi::Promise p = worker->Promise();
+    worker->Queue();
+    return p;
+}
+
+Napi::Value Setup(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object o = info[0].As<Napi::Object>();
+    auto* d = new AddonData();
+    d->BtoonError = Napi::Persistent(o.Get("BtoonError").As<Napi::Function>());
+    d->Ext = Napi::Persistent(o.Get("Ext").As<Napi::Function>());
+    d->Timestamp = Napi::Persistent(o.Get("Timestamp").As<Napi::Function>());
+    d->MapCtor = Napi::Persistent(o.Get("Map").As<Napi::Function>());
+    d->ArrayFrom = Napi::Persistent(o.Get("arrayFrom").As<Napi::Function>());
+    d->ObjectPrototype = Napi::Persistent(o.Get("objectPrototype").As<Napi::Object>());
+    env.SetInstanceData(d);  // deleted with the environment (worker threads get their own)
+    return env.Undefined();
+}
+
+Napi::Value CompressionAvailable(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    return Napi::Boolean::New(env, btoon::compression_available(parse_algorithm(env, info[0].As<Napi::String>().Utf8Value())));
+}
+
+Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    exports.Set("setup", Napi::Function::New(env, guarded<Setup>));
+    exports.Set("encode", Napi::Function::New(env, guarded<Encode>));
+    exports.Set("decode", Napi::Function::New(env, guarded<Decode>));
+    exports.Set("encodeAsync", Napi::Function::New(env, guarded<EncodeAsync>));
+    exports.Set("decodeAsync", Napi::Function::New(env, guarded<DecodeAsync>));
+    exports.Set("compressionAvailable", Napi::Function::New(env, guarded<CompressionAvailable>));
+    exports.Set("coreVersion", Napi::String::New(env, btoon::version()));
+    exports.Set("specVersion", Napi::String::New(env, btoon::spec_version()));
+    return exports;
+}
+
+}  // namespace
+
+NODE_API_MODULE(btoon, Init)
