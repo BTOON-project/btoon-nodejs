@@ -1,0 +1,82 @@
+name: Release
+
+# On a version tag: build Node-API prebuilds for every platform, verify each one loads
+# and passes the tests, then publish to npm with provenance.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prebuild:
+    name: prebuild (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine' }
+          - { name: darwin-arm64, os: macos-latest }
+          - { name: darwin-x64, os: macos-latest, arch: x64 }
+          - { name: win32-x64, os: windows-latest }
+    steps:
+      - name: Install build tools (Alpine)
+        if: matrix.container
+        run: apk add --no-cache build-base python3 git
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v7
+        if: ${{ !matrix.container }}
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts
+      - name: Build prebuild
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.arch }}" ]; then
+            npx prebuildify --napi --strip --target 18.0.0 --arch ${{ matrix.arch }}
+          else
+            npx prebuildify --napi --strip --target 18.0.0 ${{ matrix.container && '--tag-libc' || '' }}
+          fi
+      - name: Test the prebuild (cross-compiled darwin-x64 is not runnable here)
+        if: matrix.name != 'darwin-x64'
+        shell: bash
+        run: rm -rf build && npm test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prebuilds-${{ matrix.name }}
+          path: prebuilds/
+
+  publish:
+    needs: prebuild
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write   # npm provenance / trusted publishing
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: prebuilds-*
+          path: prebuilds
+          merge-multiple: true
+      - run: ls -R prebuilds
+      - run: npm install --ignore-scripts
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,250 +1,115 @@
-# BTOON for Node.js
+# btoon for Node.js
 
-[![npm version](https://img.shields.io/npm/v/btoon.svg)](https://www.npmjs.com/package/btoon)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-
-High-performance binary serialization format for Node.js applications.
-
-## Features
-
-- 🚀 **High Performance** - Native C++ implementation with Node.js bindings
-- 📦 **Compact Binary Format** - Smaller than JSON, faster than MessagePack
-- 🗜️ **Built-in Compression** - ZLIB, LZ4, ZSTD, Brotli, Snappy support
-- 📊 **Tabular Data Optimization** - Columnar storage for structured data
-- 🔄 **Schema Evolution** - Forward and backward compatibility
-- ⚡ **Zero-Copy APIs** - Minimal memory overhead for large data
-- 🛡️ **Type Safety** - Full TypeScript support included
-
-## Installation
+Native Node.js bindings for **BTOON**, a compact binary serialization format: **MessagePack
+plus a columnar encoding for arrays of uniform objects**, with timestamps, bigints, float
+vectors and optional compression/signing. Built on the C++ reference implementation
+([btoon-core](https://github.com/BTOON-project/btoon-core)), BTOON spec 0.1. The API is the
+same as [`@btoon/js`](https://github.com/BTOON-project/btoon-javascript), the pure
+JavaScript implementation.
 
 ```bash
 npm install btoon
 ```
 
-Or using yarn:
+Prebuilt binaries (Node-API, Node ≥ 18) ship for Linux x64/arm64 (glibc and musl), macOS
+arm64/x64 and Windows x64. On other platforms npm builds from source, which needs a C++20
+compiler and Python for node-gyp.
 
-```bash
-yarn add btoon
+## Usage
+
+```js
+const btoon = require('btoon');            // or: import { encode, decode } from 'btoon'
+
+const rows = Array.from({ length: 1000 }, (_, i) => ({ id: i, name: `user${i}`, active: i % 2 === 0 }));
+
+const bytes = btoon.encode(rows);           // Buffer; tables are stored column by column
+btoon.decode(bytes);                        // deep-equals rows
+
+btoon.encode(rows, { compress: true });     // zlib envelope, detected on decode
+const sealed = btoon.encode(rows, { hmacKey: process.env.BTOON_KEY });
+btoon.decode(sealed, { hmacKey: process.env.BTOON_KEY });
+
+await btoon.decodeAsync(bytes);             // parsing runs on the libuv thread pool
 ```
 
-## Quick Start
+## Types
 
-```javascript
-const btoon = require('btoon');
+| JavaScript → BTOON → JavaScript | Notes |
+|---|---|
+| `null`, `undefined` → `null` | Object properties set to `undefined` encode as nil |
+| `boolean`, `string` | Strings are UTF-8. A lone surrogate throws `invalid_utf8`; clean such strings with `toWellFormed()` |
+| `number` | Safe integers encode as integers. Everything else, including `-0`, NaN and ±Infinity, encodes as float64. |
+| `bigint` | Uses 64-bit ints when it fits, the bigint extension otherwise. Decodes to `bigint` beyond `Number.MAX_SAFE_INTEGER` (or always, with `bigint: 'always'`). |
+| `Buffer`, `Uint8Array`, other typed arrays, `ArrayBuffer`, `DataView` → `Buffer` | |
+| `Float32Array`, `Float64Array` | Packed float vectors (little-endian); embeddings take 4 bytes per value |
+| `Date` → `Date` | `Timestamp` keeps nanoseconds and a UTC offset (`timestamps: 'object'`) |
+| arrays, plain objects, `Map` (string keys), class instances | Like `JSON.stringify`: own enumerable properties, and `toJSON()` is honored. Keys are written in UTF-8 byte order. |
+| `Ext(type, data)` | Any other extension type |
 
-// Encode data
-const data = {
-  name: 'BTOON',
-  version: '0.0.1',
-  features: ['fast', 'compact', 'typed'],
-  metrics: {
-    speed: 9000,
-    size: 0.5
-  }
-};
+Functions and symbols throw `BtoonError` with `code: 'invalid_argument'`. Cycles throw
+`code: 'max_depth'`. A decoded key named `"__proto__"` becomes an ordinary own property and
+never touches the prototype.
 
-const encoded = btoon.encode(data);
-console.log('Encoded size:', encoded.length);
+## Options
 
-// Decode data
-const decoded = btoon.decode(encoded);
-console.log('Decoded:', decoded);
+```ts
+encode(value, { compress?, compression?: 'zlib'|'lz4'|'zstd'|'brotli'|'snappy', autoTabular?, maxDepth?, hmacKey? })
+decode(bytes, { strict?, maxDepth?, maxDecompressedSize?, autoDecompress?, hmacKey?, timestamps?: 'date'|'object', bigint?: 'auto'|'always' })
+compressionAvailable('zstd')   // the prebuilt binaries include zlib only
 ```
 
-## Advanced Features
+## Untrusted input
 
-### Compression
+`decode` is safe on hostile bytes:
+- reads are bounds-checked and nesting depth is limited;
+- it never allocates more than the input justifies, and decompression is capped
+  (`maxDecompressedSize`, 256 MiB by default);
+- strict mode (the default) rejects invalid UTF-8, duplicate keys and trailing data.
 
-```javascript
-// Enable compression
-const compressed = btoon.encode(data, {
-  compress: true,
-  algorithm: 'zstd',  // 'zlib', 'lz4', 'zstd', 'brotli', 'snappy'
-  level: 3
-});
-```
-
-### Tabular Data
-
-```javascript
-// Automatically detect and optimize tabular data
-const records = [
-  { id: 1, name: 'Alice', age: 30 },
-  { id: 2, name: 'Bob', age: 25 },
-  { id: 3, name: 'Charlie', age: 35 }
-];
-
-const tabular = btoon.encode(records, {
-  autoTabular: true  // Automatically uses columnar encoding
-});
-```
-
-### Streaming
-
-```javascript
-const { Readable } = require('stream');
-const fs = require('fs');
-
-// Stream encoding
-const encoder = btoon.createEncoder();
-const output = fs.createWriteStream('data.btoon');
-
-encoder.pipe(output);
-encoder.write({ chunk: 1 });
-encoder.write({ chunk: 2 });
-encoder.end();
-
-// Stream decoding
-const decoder = btoon.createDecoder();
-const input = fs.createReadStream('data.btoon');
-
-input.pipe(decoder);
-decoder.on('data', (obj) => {
-  console.log('Decoded object:', obj);
-});
-```
-
-### TypeScript Support
-
-```typescript
-import * as btoon from 'btoon';
-
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-const user: User = {
-  id: 1,
-  name: 'John Doe',
-  email: 'john@example.com'
-};
-
-const encoded = btoon.encode<User>(user);
-const decoded = btoon.decode<User>(encoded);
-```
-
-## Schema Support
-
-```javascript
-// Define schema
-const schema = {
-  type: 'object',
-  properties: {
-    id: { type: 'integer', required: true },
-    name: { type: 'string', required: true },
-    age: { type: 'integer', min: 0, max: 120 }
-  }
-};
-
-// Validate and encode with schema
-const validator = btoon.createValidator(schema);
-if (validator.validate(data)) {
-  const encoded = btoon.encode(data, { schema });
-}
-```
-
-## API Reference
-
-### Core Functions
-
-#### `encode(data, options?)`
-Encode JavaScript data to BTOON format.
-
-**Parameters:**
-- `data` - Any JavaScript value
-- `options` (optional):
-  - `compress`: boolean - Enable compression (default: false)
-  - `algorithm`: string - Compression algorithm
-  - `level`: number - Compression level (1-9)
-  - `autoTabular`: boolean - Auto-detect tabular data
-  - `schema`: object - Schema definition
-
-**Returns:** Buffer
-
-#### `decode(buffer, options?)`
-Decode BTOON data to JavaScript values.
-
-**Parameters:**
-- `buffer` - Buffer containing BTOON data
-- `options` (optional):
-  - `decompress`: boolean - Enable decompression
-  - `schema`: object - Expected schema
-
-**Returns:** JavaScript value
-
-### Streaming API
-
-#### `createEncoder(options?)`
-Create a transform stream for encoding.
-
-#### `createDecoder(options?)`
-Create a transform stream for decoding.
-
-### Schema API
-
-#### `createValidator(schema)`
-Create a schema validator.
-
-#### `validateSchema(schema)`
-Validate a schema definition.
+Every failure throws `BtoonError`, and `err.code` is a spec error code: `truncated`,
+`max_depth`, `invalid_utf8`, `size_limit`, `authentication_failed`, and so on.
 
 ## Performance
 
-BTOON provides significant performance improvements over JSON:
+Size is where BTOON helps. For 10,000 records (`id`, `name`, `email`, `age`, `score`,
+`active`) BTOON is **447 KB**, against 767 KB for MessagePack and 1,018 KB for JSON.
 
-| Operation | JSON | BTOON | Improvement |
-|-----------|------|--------|-------------|
-| Encode 1MB | 45ms | 8ms | 5.6x faster |
-| Decode 1MB | 38ms | 6ms | 6.3x faster |
-| Size | 1024KB | 412KB | 60% smaller |
+Speed is a different story. Measured on Node 22.22, Apple M4 Max, best of 15, same data
+and byte-identical BTOON output:
 
-With compression:
-- ZLIB: 75% size reduction
-- LZ4: 65% reduction, 3x faster
-- ZSTD: 80% reduction, balanced
+| | encode | decode |
+|---|---:|---:|
+| `btoon` (this package, native) | 7.8 ms | 7.1 ms |
+| [`@btoon/js`](https://github.com/BTOON-project/btoon-javascript) (pure TypeScript) | 1.1 ms | 1.6 ms |
+| `@msgpack/msgpack` 3.1 (pure JS) | 2.7 ms | 2.5 ms |
+| `JSON` | 1.5 ms | 1.9 ms |
 
-## Examples
+This binding is the slowest of these. Each property access and object creation crosses
+the Node-API boundary, while V8 optimizes pure JavaScript very well. For throughput, use
+`@btoon/js`: same API, same bytes. This package is useful when you want the reference
+C++ implementation itself, or Zstd/LZ4/Brotli/Snappy envelopes from a build that
+includes them.
 
-See the [`examples/`](examples/) directory for more usage examples:
-- Basic encoding/decoding
-- Tabular data handling
-- Streaming operations
-- Schema validation
-- Compression benchmarks
+## Interoperability
 
-## Requirements
+With `autoTabular: false` the output is canonical MessagePack, which `@msgpack/msgpack`
+and every other MessagePack library read. MessagePack input with string keys decodes,
+including timestamps. The same bytes decode identically in the
+[Python](https://github.com/BTOON-project/btoon-python),
+[browser](https://github.com/BTOON-project/btoon-javascript),
+[Go](https://github.com/BTOON-project/btoon-go) and
+[PHP](https://github.com/BTOON-project/btoon-php) libraries.
 
-- Node.js >= 18.0.0
-- C++ compiler (for native modules)
-- Python (for node-gyp)
-
-## Building from Source
+## Development
 
 ```bash
-git clone https://github.com/BTOON-project/btoon-nodejs.git
-cd btoon-nodejs
-npm install
-npm run build
-npm test
+git clone --recursive https://github.com/BTOON-project/btoon-nodejs && cd btoon-nodejs
+npm install && npm run build && npm test
 ```
 
-## Contributing
-
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
+The build compiles `core/src/*.cpp` straight into the addon, with no separate library and
+no OpenSSL. If `core/` is empty, it falls back to `../btoon-core` or `BTOON_CORE_DIR`.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Links
-
-- [Website](https://btoon.net)
-- [GitHub](https://github.com/BTOON-project/btoon-nodejs)
-- [Documentation](https://btoon.net/docs)
-- [npm Package](https://www.npmjs.com/package/btoon)
-
----
-
-Part of the BTOON project - High-performance binary serialization for modern applications.
+MIT
