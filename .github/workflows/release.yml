@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Install build tools (Alpine)
         if: matrix.container
-        run: apk add --no-cache build-base python3 git
+        run: apk add --no-cache bash build-base python3 git
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -76,7 +76,12 @@ jobs:
           path: prebuilds
           merge-multiple: true
       - run: ls -R prebuilds
+      - name: Check that the tag matches package.json
+        run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
       - run: npm install --ignore-scripts
+      # npm >= 11.5.1 uses trusted publishing (OIDC) when it's configured on npmjs.com,
+      # and falls back to the NPM_TOKEN secret otherwise.
+      - run: npm install -g npm@11
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
