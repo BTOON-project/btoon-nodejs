@@ -316,9 +316,10 @@ test('ESM entry point', async () => {
 test('fuzz: hostile bytes only ever raise BtoonError', () => {
   const fs = require('node:fs');
   const path = require('node:path');
-  const vectorsPath = [path.join(__dirname, '../core/tests/vectors/btoon-vectors.json'),
-    path.join(__dirname, '../../btoon-core/tests/vectors/btoon-vectors.json')].find((p) => fs.existsSync(p));
-  const seeds = JSON.parse(fs.readFileSync(vectorsPath, 'utf8')).vectors.map((v) => Buffer.from(v.hex, 'hex')).filter((b) => b.length);
+  const vectorsPath = [process.env.BTOON_VECTORS, path.join(__dirname, '../core/tests/vectors/btoon-vectors.json'),
+    path.join(__dirname, '../../btoon-core/tests/vectors/btoon-vectors.json')].find((p) => p && fs.existsSync(p));
+  // encode_error vectors (spec §10) have a value but no bytes.
+  const seeds = JSON.parse(fs.readFileSync(vectorsPath, 'utf8')).vectors.filter((v) => v.hex).map((v) => Buffer.from(v.hex, 'hex'));
   let state = 0x12345678;
   const rand = (n) => { state = (state * 1103515245 + 12345) >>> 0; return state % n; };
   let decoded = 0;
@@ -515,4 +516,199 @@ test('an hmacKey string with a lone surrogate is invalid_argument on every entry
     assert.deepStrictEqual(decode(encode({ a: 1 }, { hmacKey }), { hmacKey }), { a: 1 });
     assert.deepStrictEqual(await decodeAsync(await encodeAsync({ a: 1 }, { hmacKey }), { hmacKey }), { a: 1 });
   }
+});
+
+// --- spec 0.2: resource limits and stricter rules ------------------------------------------
+
+const hexBuf = (h) => Buffer.from(h, 'hex');
+const isCode = (c) => (e) => e instanceof BtoonError && e.code === c;
+// decode and decodeAsync must agree: the options reach the thread pool too.
+const decodeBoth = async (bytes, options) => {
+  let sync;
+  try {
+    sync = { value: decode(bytes, options) };
+  } catch (e) {
+    sync = { error: e };
+  }
+  let async;
+  try {
+    async = { value: await decodeAsync(bytes, options) };
+  } catch (e) {
+    async = { error: e };
+  }
+  assert.deepStrictEqual(async, sync);
+  if (sync.error) throw sync.error;
+  return sync.value;
+};
+const decodeCode = async (bytes, options) => {
+  try {
+    await decodeBoth(bytes, options);
+  } catch (e) {
+    assert.ok(e instanceof BtoonError, `expected BtoonError, got ${e && e.name}: ${e && e.message}`);
+    return e.code;
+  }
+  assert.fail('expected an error');
+};
+
+test('maxValues counts every decoded value, on decode and decodeAsync', async () => {
+  // spec §7.1: a value counts once when it starts; object keys don't count.
+  for (const [hex, atLimit, value] of [['93010203', 4, [1, 2, 3]], ['81a1619101', 3, { a: [1] }], ['9291019102', 5, [[1], [2]]]]) {
+    assert.deepStrictEqual(await decodeBoth(hexBuf(hex), { maxValues: atLimit }), value);
+    assert.equal(await decodeCode(hexBuf(hex), { maxValues: atLimit - 1 }), 'size_limit', hex);
+  }
+  // A table: the array, its row objects and its cells. Column names don't count.
+  const rows = Array.from({ length: 20 }, (_, i) => ({ a: i, b: -i }));
+  const table = encode(rows);
+  assert.equal(table[2], 0xf6);
+  const total = 1 + 20 + 40;
+  assert.deepStrictEqual(await decodeBoth(table, { maxValues: total }), rows);
+  assert.deepStrictEqual(await decodeBoth(encode(rows, { autoTabular: false }), { maxValues: total }), rows);
+  assert.equal(await decodeCode(table, { maxValues: total - 1 }), 'size_limit');
+  assert.equal(await decodeCode(table, { maxValues: 20 }), 'size_limit');
+  // Values inside a compression envelope count; the envelope doesn't.
+  const packed = encode(new Array(1000).fill(null), { compress: true });
+  assert.equal(packed.subarray(0, 4).toString(), 'BTON');
+  assert.equal((await decodeBoth(packed, { maxValues: 1001 })).length, 1000);
+  assert.equal(await decodeCode(packed, { maxValues: 1000 }), 'size_limit');
+  // The default is 2^20.
+  const nils = (n) => {
+    const b = Buffer.alloc(5 + n, 0xc0);
+    b[0] = 0xdd;
+    b.writeUInt32BE(n, 1);
+    return b;
+  };
+  assert.equal((await decodeBoth(nils(2 ** 20 - 1))).length, 2 ** 20 - 1);
+  assert.equal(await decodeCode(nils(2 ** 20)), 'size_limit');
+  assert.equal((await decodeBoth(nils(2 ** 20), { maxValues: 2 ** 20 + 1 })).length, 2 ** 20);
+});
+
+test('maxValues is validated like maxDecompressedSize', async () => {
+  for (const name of ['maxValues', 'maxDecompressedSize']) {
+    for (const bad of [-1, 1.5, '8', NaN, Infinity, 2 ** 53, true, {}]) {
+      assert.equal(code(() => decode(hexBuf('01'), { [name]: bad })), 'invalid_argument', `${name}: ${String(bad)}`);
+      await assert.rejects(decodeAsync(hexBuf('01'), { [name]: bad }), isCode('invalid_argument'), `${name}: ${String(bad)}`);
+    }
+    const smallest = name === 'maxValues' ? 1 : 0; // '01' is one value
+    for (const ok of [smallest, 2 ** 53 - 1, undefined, null]) { // undefined and null: the default
+      assert.equal(decode(hexBuf('01'), { [name]: ok }), 1);
+      assert.equal(await decodeAsync(hexBuf('01'), { [name]: ok }), 1);
+    }
+  }
+  assert.equal(code(() => decode(hexBuf('01'), { maxValues: 0 })), 'size_limit'); // even one value is too many
+});
+
+test('maxDecompressedSize defaults to 64 MiB and bounds the column names a table copies', async () => {
+  const envelope = (declared) => {
+    const b = hexBuf('42544f4e01000000000000040000000078da0300'); // the payload isn't valid
+    b.writeUInt32BE(declared, 12);
+    return b;
+  };
+  assert.equal(await decodeCode(envelope(64 * 2 ** 20 + 1)), 'size_limit');
+  assert.equal(await decodeCode(envelope(64 * 2 ** 20 + 1), { maxDecompressedSize: 64 * 2 ** 20 + 1 }), 'invalid_envelope');
+  // spec §7.1: rows × the column names' bytes must not exceed maxDecompressedSize.
+  const rows = new Array(5).fill({ abcd: null, efgh: null });
+  const table = encode(rows);
+  assert.equal(table[2], 0xf6);
+  assert.deepStrictEqual(await decodeBoth(table, { maxDecompressedSize: 5 * 8 }), rows);
+  assert.equal(await decodeCode(table, { maxDecompressedSize: 5 * 8 - 1 }), 'size_limit');
+});
+
+test('maxDepth is at most 1000 on every entry point', async () => {
+  // spec §7: a deeper limit would let input, or a deep value, exhaust the native stack.
+  for (const maxDepth of [1001, 30000, 2 ** 53]) {
+    assert.equal(code(() => encode(1, { maxDepth })), 'invalid_argument');
+    assert.equal(code(() => decode(hexBuf('01'), { maxDepth })), 'invalid_argument');
+    await assert.rejects(encodeAsync(1, { maxDepth }), isCode('invalid_argument'));
+    await assert.rejects(decodeAsync(hexBuf('01'), { maxDepth }), isCode('invalid_argument'));
+  }
+  // The addon checks too, for callers that skip index.js.
+  const native = require('node-gyp-build')(require('node:path').join(__dirname, '..'));
+  const encodeOptions = { compress: false, compression: 'zlib', autoTabular: true, maxDepth: 1001, hmacKey: undefined };
+  const decodeOptions = { strict: true, maxDepth: 1001, maxDecompressedSize: 1, maxValues: 1, autoDecompress: true,
+    hmacKey: undefined, timestamps: 'date', bigint: 'auto' };
+  assert.equal(code(() => native.encode(1, encodeOptions)), 'invalid_argument');
+  assert.equal(code(() => native.decode(hexBuf('01'), decodeOptions)), 'invalid_argument');
+  assert.equal(code(() => native.decode(hexBuf('01'), { ...decodeOptions, maxDepth: 5, maxValues: -1 })), 'invalid_argument');
+  assert.equal(code(() => native.decode(hexBuf('01'), { ...decodeOptions, maxDepth: 5, hmacKey: null })), 'invalid_argument');
+});
+
+test('maxDepth 1000 works on the main thread and in a worker', async () => {
+  const deep = (n) => {
+    let v = null;
+    for (let i = 0; i < n; i++) v = [v];
+    return v;
+  };
+  const bytes = Buffer.concat([Buffer.alloc(1000, 0x91), Buffer.from([0xc0])]);
+  assert.deepStrictEqual(encode(deep(1000), { maxDepth: 1000 }), bytes);
+  assert.deepStrictEqual(await encodeAsync(deep(1000), { maxDepth: 1000 }), bytes);
+  assert.deepStrictEqual(decode(bytes, { maxDepth: 1000 }), deep(1000));
+  assert.deepStrictEqual(await decodeAsync(bytes, { maxDepth: 1000 }), deep(1000));
+  assert.equal(code(() => encode(deep(1001), { maxDepth: 1000 })), 'max_depth');
+  assert.equal(await decodeCode(Buffer.concat([Buffer.alloc(1001, 0x91), Buffer.from([0xc0])]), { maxDepth: 1000 }), 'max_depth');
+  // Worker threads have smaller stacks than the main thread.
+  const { Worker } = require('node:worker_threads');
+  const src = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    const btoon = require(workerData.lib);
+    let v = null;
+    for (let i = 0; i < 1000; i++) v = [v];
+    const bytes = btoon.encode(v, { maxDepth: 1000 });
+    btoon.decode(bytes, { maxDepth: 1000 });
+    btoon.decodeAsync(bytes, { maxDepth: 1000 }).then(() => parentPort.postMessage(bytes.length));`;
+  const w = new Worker(src, { eval: true, workerData: { lib: require.resolve('..') } });
+  const length = await new Promise((resolve, reject) => {
+    w.once('message', resolve);
+    w.once('error', reject);
+  });
+  await w.terminate();
+  assert.equal(length, 1001);
+});
+
+// spec §8 (D25): "no key" is only an absent key. null used to mean no key, so a key read from
+// an unset source turned signing and verification off; it's now invalid_argument, as in @btoon/js.
+test('hmacKey: null is invalid_argument on every entry point', async () => {
+  const doc = encode({ a: 1 });
+  const sealed = encode({ a: 1 }, { hmacKey: 'k'.repeat(32) });
+  assert.equal(code(() => encode({ a: 1 }, { hmacKey: null })), 'invalid_argument');
+  assert.equal(code(() => decode(doc, { hmacKey: null })), 'invalid_argument');
+  assert.equal(code(() => decode(sealed, { hmacKey: null })), 'invalid_argument');
+  await assert.rejects(encodeAsync({ a: 1 }, { hmacKey: null }), isCode('invalid_argument'));
+  await assert.rejects(decodeAsync(doc, { hmacKey: null }), isCode('invalid_argument'));
+  await assert.rejects(decodeAsync(sealed, { hmacKey: null }), isCode('invalid_argument'));
+  assert.deepStrictEqual(encode({ a: 1 }, {}), doc); // leaving it out still means no key
+  assert.equal(code(() => decode(sealed, {})), 'authentication_failed');
+});
+
+// spec §5.7: written verbatim, Ext(-4, [5]) was the non-canonical d4fc05 and Ext(-1, [1, 2, 3])
+// a timestamp that every decoder rejects. As in @btoon/js, the constructor still accepts them.
+test('Ext with an id BTOON defines is refused by encode, sync and async', async () => {
+  for (const type of [-1, -2, -3, -4, -5, -6, -10]) {
+    const ext = new Ext(type, new Uint8Array(8));
+    for (const v of [ext, [1, ext], { k: ext }, new Array(20).fill({ key: ext })]) {
+      assert.equal(code(() => encode(v)), 'invalid_argument', `type ${type}`);
+      await assert.rejects(encodeAsync(v), isCode('invalid_argument'), `type ${type}`);
+    }
+    const mutated = new Ext(5, [1]); // the fields are writable: encode checks the type it sees
+    mutated.type = type;
+    assert.equal(code(() => encode(mutated)), 'invalid_argument', `mutated to ${type}`);
+  }
+  assert.equal(encode(new Array(20).fill({ key: 1 }))[2], 0xf6); // that shape is a table
+});
+
+test('Ext with any other id encodes as given', () => {
+  for (const type of [-7, -8, -9, -11, -64, -128, 0, 1, 127]) {
+    const bytes = encode(new Ext(type, [5]));
+    assert.deepStrictEqual([...bytes], [0xd4, type & 0xff, 5]);
+    const back = decode(bytes);
+    assert.ok(back instanceof Ext);
+    assert.deepStrictEqual([back.type, [...back.data]], [type, [5]]);
+  }
+});
+
+test('non-strict decode still requires UTF-8 keys and column names', async () => {
+  // spec §7: keys compare by bytes, so a lenient decoder must not merge two invalid keys into U+FFFD.
+  for (const hex of ['81a1ff01', '82a1ff01a1fe02', 'c717f600000001000000010000000100000001ff0000000001c0']) {
+    assert.equal(await decodeCode(hexBuf(hex), { strict: false }), 'invalid_utf8', hex);
+  }
+  assert.equal(decode(hexBuf('a1ff'), { strict: false }), '�'); // string values may still be lenient
 });

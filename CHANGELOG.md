@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.0 (2026-11-14)
+
+BTOON spec 0.2, on btoon-core 0.2.0: `SPEC_VERSION` is `'0.2'`. The wire format is
+unchanged, but decoding has new limits and encoding new rules, so some input that 0.1
+accepted is now refused. These match `@btoon/js` 0.2. Each behavior change is marked.
+
+- **New: the `maxValues` decode option** bounds how many values a document decodes to (spec
+  §7.1), in `decode` and `decodeAsync`. The top-level value, every array element, object
+  value and extension value, and every table row and cell count once; keys don't. Values
+  inside a compression envelope count. It's validated like `maxDecompressedSize`: a
+  non-negative safe integer, with `undefined` or `null` for the default. **Behavior
+  change:** the default is 2^20 (1,048,576), and a document over it throws `BtoonError`
+  `size_limit`. Pass a larger `maxValues` for bigger documents, such as a table of 100,000
+  rows × 10 columns (1,100,001 values).
+- **Behavior change:** `maxDecompressedSize` now defaults to 64 MiB, down from 256 MiB. It
+  also bounds tables: rows × the total bytes of the column names (which are copied into
+  every row) over the limit is `size_limit`. With `maxValues`, this bounds what a small
+  input can make the decoder allocate: in 0.1, a few KB of compressed input could demand
+  gigabytes.
+- **Behavior change:** `maxDepth` above 1000 throws `BtoonError` `invalid_argument` in
+  `encode`, `decode`, `encodeAsync` and `decodeAsync`. A raised limit used to let deep
+  input or a deep value overflow the native stack and crash the process (about 30,000
+  levels on the main thread, 15,000 in a worker). The default stays 128.
+- **Behavior change:** `hmacKey: null` throws `invalid_argument` in `encode`, `decode`,
+  `encodeAsync` and `decodeAsync`, as in `@btoon/js` (spec §8). It used to mean "no key", so
+  a key read from an unset source silently turned signing and verification off. Only an
+  absent key (`undefined`) means no key now. An empty key was already an error.
+- **Behavior change:** encoding an `Ext` whose type BTOON defines itself (-1 to -6, and
+  -10) throws `BtoonError` `invalid_argument` (spec §5.7), in `encode` and `encodeAsync`. It
+  used to be written verbatim, so `new Ext(-4, [5])` produced the non-canonical `d4fc05`,
+  and `new Ext(-1, [1, 2, 3])` a timestamp that every decoder rejects. Those types are
+  written from `Date`, `Timestamp`, `bigint`, `Float32Array`/`Float64Array` and arrays of
+  objects, so there is no longer a way to write the date (-2) and datetime (-3) extensions.
+  As in `@btoon/js`, the `Ext` constructor still accepts every type in -128..127, and the
+  types reserved for future versions (-7 to -9, -11 to -128) are written as given.
+- **Behavior change:** with `strict: false`, keys and table column names must still be
+  valid UTF-8 (`invalid_utf8`). Invalid ones used to become U+FFFD, which merged distinct
+  keys and silently dropped values. String values are unchanged.
+- **Behavior change:** table column names are checked front to back, each for UTF-8 and
+  then against the earlier names. A duplicate name ahead of an invalid one is now
+  `invalid_tabular` instead of `invalid_utf8`.
+- **Docs:** the README's signing example no longer passes `process.env.BTOON_KEY` straight
+  through, where an unset variable would have meant "unsigned".
+- **Tests:** the conformance harness honors every vector option (`strict`, `max_depth`,
+  `max_decompressed_size`, `max_values`, `hmac_key`), runs the `encode_error` vectors,
+  compares float vector elements bit for bit (NaN payloads included), and runs every
+  vector through `decodeAsync`/`encodeAsync` too. Canonical floats that aren't safe
+  integers (2^53, 1e300, the largest double) are now re-encoded, as in `@btoon/js`.
+
 ## 0.1.2 (2026-11-13)
 
 - **Core:** built on btoon-core 0.1.5. Nested containers no longer reserve memory against

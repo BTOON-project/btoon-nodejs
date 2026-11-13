@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -446,6 +447,9 @@ private:
         return d >= lo && d <= hi && d == std::trunc(d);
     }
 
+    // Core's encodeExtension() rejects the ids BTOON defines (-1…-6, -10) with invalid_argument
+    // (SPEC §5.7), which encode_bare() turns into a BtoonError: those types are written from
+    // their typed values, never verbatim.
     void encode_ext(Napi::Object o) {
         Napi::Value type = o.Get("type");
         if (!is_integer_in(type, -128, 127)) throw_btoon(env_, "invalid_argument", "Ext type must be an integer in [-128, 127]");
@@ -703,14 +707,34 @@ CompressionAlgorithm parse_algorithm(Napi::Env env, const std::string& name) {
     throw_btoon(env, "invalid_argument", "unknown compression algorithm: '" + name + "'");
 }
 
-// The HMAC key. Core takes an empty string as "no key", so an empty key given here must never
-// get that far: it's a misconfiguration, and SPEC §8 says to reject it (index.js does so first).
-std::string hmac_key_option(Napi::Env env, Napi::Value v) {
-    if (v.IsUndefined() || v.IsNull()) return {};
+// The HMAC key (SPEC §8). Only an absent key (undefined) means "no key". null and an empty key
+// are misconfigurations that would otherwise turn signing or verification off, so they're
+// invalid_argument, as in @btoon/js. index.js checks first; this covers direct native calls.
+std::optional<std::string> hmac_key_option(Napi::Env env, Napi::Value v) {
+    if (v.IsUndefined()) return std::nullopt;
     if (!v.IsTypedArray()) throw_btoon(env, "invalid_argument", "hmacKey must be a Uint8Array");
     auto bytes = typed_array_bytes(env, v).bytes;
     if (bytes.empty()) throw_btoon(env, "invalid_argument", "hmacKey must not be empty (omit it for no key)");
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+// A limit index.js has already checked: a non-negative safe integer. One beyond size_t (on a
+// 32-bit build) means no limit; it must never wrap to a small one.
+size_t limit_option(Napi::Env env, Napi::Object o, const char* name) {
+    Napi::Value v = o.Get(name);
+    const double d = v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : -1;
+    if (!(d >= 0 && d == std::trunc(d))) throw_btoon(env, "invalid_argument", std::string(name) + " must be a non-negative integer");
+    if (d >= static_cast<double>(SIZE_MAX)) return SIZE_MAX;
+    return static_cast<size_t>(d);
+}
+
+// SPEC §7: a deeper limit would let input, or a deep value, exhaust the native stack.
+size_t max_depth_option(Napi::Env env, Napi::Object o) {
+    const size_t depth = limit_option(env, o, "maxDepth");
+    if (depth > kMaxDepthLimit) {
+        throw_btoon(env, "invalid_argument", "maxDepth must be at most " + std::to_string(kMaxDepthLimit));
+    }
+    return depth;
 }
 
 EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
@@ -718,7 +742,7 @@ EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
     opts.compress = o.Get("compress").ToBoolean().Value();
     opts.compression_algorithm = parse_algorithm(env, o.Get("compression").As<Napi::String>().Utf8Value());
     opts.auto_tabular = o.Get("autoTabular").ToBoolean().Value();
-    opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
+    opts.max_depth = max_depth_option(env, o);
     opts.hmac_key = hmac_key_option(env, o.Get("hmacKey"));
     opts.validate_utf8 = false;  // N-API strings are always well-formed UTF-8
     return opts;
@@ -727,8 +751,9 @@ EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
 DecodeOptions decode_options(Napi::Env env, Napi::Object o) {
     DecodeOptions opts;
     opts.strict = o.Get("strict").ToBoolean().Value();
-    opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
-    opts.max_decompressed_size = static_cast<size_t>(o.Get("maxDecompressedSize").As<Napi::Number>().Int64Value());
+    opts.max_depth = max_depth_option(env, o);
+    opts.max_decompressed_size = limit_option(env, o, "maxDecompressedSize");
+    opts.max_values = limit_option(env, o, "maxValues");
     opts.auto_decompress = o.Get("autoDecompress").ToBoolean().Value();
     opts.hmac_key = hmac_key_option(env, o.Get("hmacKey"));
     return opts;
@@ -773,7 +798,7 @@ Napi::Value Encode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     EncodeOptions opts = encode_options(env, info[1].As<Napi::Object>());
     std::vector<uint8_t> out = encode_bare(env, info[0], opts);
-    if (opts.compress || !opts.hmac_key.empty()) {
+    if (opts.compress || opts.hmac_key) {
         try {
             out = btoon::apply_envelopes(std::move(out), opts);
         } catch (const BtoonException& e) {
@@ -950,6 +975,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("compressionAvailable", Napi::Function::New(env, guarded<CompressionAvailable>));
     exports.Set("coreVersion", Napi::String::New(env, btoon::version()));
     exports.Set("specVersion", Napi::String::New(env, btoon::spec_version()));
+    // Core's limits (SPEC §7, §7.1), so index.js's defaults can't drift from them.
+    exports.Set("defaultMaxDepth", Napi::Number::New(env, static_cast<double>(kDefaultMaxDepth)));
+    exports.Set("maxDepthLimit", Napi::Number::New(env, static_cast<double>(kMaxDepthLimit)));
+    exports.Set("defaultMaxDecompressedSize", Napi::Number::New(env, static_cast<double>(kDefaultMaxDecompressedSize)));
+    exports.Set("defaultMaxValues", Napi::Number::New(env, static_cast<double>(kDefaultMaxValues)));
     return exports;
 }
 
