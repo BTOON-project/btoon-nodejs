@@ -337,3 +337,182 @@ test('fuzz: hostile bytes only ever raise BtoonError', () => {
   }
   assert.ok(decoded > 1000);
 });
+
+// Instants beyond Date's range (±8.64e15 ms) used to decode to Invalid Date with the default
+// timestamps: 'date', silently destroying valid documents from other libraries: an INT64_MAX
+// "never" sentinel, or seconds = 1e13. Like @btoon/js, they decode to a Timestamp instead.
+test('timestamps outside the range of Date decode to Timestamp, not Invalid Date', async () => {
+  const i64 = (n) => {
+    const b = Buffer.alloc(8);
+    b.writeBigInt64BE(BigInt(n));
+    return b.toString('hex');
+  };
+  const u32 = (n) => n.toString(16).padStart(8, '0');
+  const ts = (s, ns = 0) => Buffer.from(`c70cff${u32(ns)}${i64(s)}`, 'hex'); // 12-byte timestamp
+  const tsOffset = (s, off) => Buffer.from(`c70eff${u32(0)}${i64(s)}${(off & 0xffff).toString(16).padStart(4, '0')}`, 'hex');
+  const dateExt = (ms) => Buffer.from(`d7fe${i64(ms)}`, 'hex'); // BTOON date (-2): int64 milliseconds
+  const INT64_MAX = 2n ** 63n - 1n;
+  const MAX_S = 8_640_000_000_000n; // Date's range, in seconds
+  const MAX_MS = 8.64e15;
+  const timestamp = (v, s, ns = 0, off = undefined) => {
+    assert.ok(v instanceof Timestamp, `expected a Timestamp, got ${v instanceof Date ? `Date(${v.getTime()})` : v}`);
+    assert.deepStrictEqual([v.seconds, v.nanoseconds, v.offsetMinutes], [BigInt(s), ns, off]);
+  };
+  const date = (v, ms) => {
+    assert.ok(v instanceof Date, `expected a Date, got ${v}`);
+    assert.equal(v.getTime(), ms);
+  };
+  for (const dec of [decode, (b) => decodeAsync(b)]) {
+    timestamp(await dec(ts(INT64_MAX)), INT64_MAX);
+    timestamp(await dec(ts(-(2n ** 63n), 5)), -(2n ** 63n), 5);
+    timestamp(await dec(ts(1e13)), 1e13);
+    timestamp(await dec(ts(-1e13)), -1e13);
+    timestamp(await dec(tsOffset(1e13, -330)), 1e13, 0, -330); // the offset is kept
+    timestamp(await dec(dateExt(INT64_MAX)), INT64_MAX / 1000n, 807_000_000);
+    // The boundaries are Date's own, to the millisecond.
+    date(await dec(ts(MAX_S, 999_999)), MAX_MS);
+    timestamp(await dec(ts(MAX_S, 1_000_000)), MAX_S, 1_000_000);
+    date(await dec(ts(-MAX_S)), -MAX_MS);
+    timestamp(await dec(ts(-MAX_S - 1n, 999_999_999)), -MAX_S - 1n, 999_999_999);
+    date(await dec(dateExt(MAX_MS)), MAX_MS);
+    timestamp(await dec(dateExt(MAX_MS + 1)), MAX_S, 1_000_000);
+    timestamp(await dec(dateExt(-MAX_MS - 1)), -MAX_S - 1n, 999_000_000);
+    date(await dec(tsOffset(1, 60)), 1000); // in range: a Date, the offset dropped (as before)
+  }
+  // Nothing is lost: the Timestamp re-encodes to the same bytes.
+  assert.equal(encode(decode(ts(INT64_MAX))).toString('hex'), ts(INT64_MAX).toString('hex'));
+  const doc = decode(encode({ never: decode(ts(INT64_MAX)), when: new Date(0) }));
+  timestamp(doc.never, INT64_MAX);
+  date(doc.when, 0);
+  // toDate() throws rather than returning Invalid Date.
+  assert.equal(code(() => new Timestamp(INT64_MAX).toDate()), 'invalid_argument');
+  assert.equal(code(() => new Timestamp(MAX_S, 1_000_000).toDate()), 'invalid_argument');
+  assert.equal(new Timestamp(MAX_S, 999_999).toDate().getTime(), MAX_MS);
+  assert.equal(new Timestamp(-MAX_S).toDate().getTime(), -MAX_MS);
+});
+
+// new Timestamp(2n ** 64n) used to encode as the epoch and 2n ** 63n as -2^63: the binding
+// ignored napi_get_value_bigint_int64's lossless flag. An offset, nanoseconds or Ext type
+// assigned after construction wrapped the same way (Ext type 300 became 44). Like @btoon/js,
+// these throw BtoonError 'invalid_argument', in the constructors and again in encode.
+test('Timestamp and Ext fields out of range throw instead of wrapping', async () => {
+  for (const s of [2n ** 64n + 5n, 2n ** 63n, -(2n ** 63n) - 1n, 2 ** 63, -(2 ** 64), 1.5, NaN, 'x', undefined]) {
+    assert.equal(code(() => new Timestamp(s, 0)), 'invalid_argument', `seconds ${String(s)}`);
+  }
+  for (const s of [2n ** 63n - 1n, -(2n ** 63n), 2 ** 62]) {
+    const t = new Timestamp(s, 999_999_999, -60);
+    assert.deepStrictEqual(decode(encode(t), { timestamps: 'object' }), t);
+  }
+  for (const [ns, off] of [[1e9, undefined], [-1, undefined], [0.5, undefined], ['1', undefined], [0, 1081], [0, -1081], [0, 1.5], [0, null]]) {
+    assert.equal(code(() => new Timestamp(0, ns, off)), 'invalid_argument', `nanoseconds ${ns}, offset ${off}`);
+  }
+  for (const type of [128, -129, 1.5, '5', NaN, undefined]) {
+    assert.equal(code(() => new Ext(type, [])), 'invalid_argument', `Ext type ${String(type)}`);
+  }
+  // The fields are writable (as in @btoon/js), so encode checks them again.
+  const mutations = [
+    [() => new Timestamp(0), (t) => { t.seconds = 2n ** 64n; }],
+    [() => new Timestamp(0), (t) => { t.seconds = 2n ** 63n; }],
+    [() => new Timestamp(0), (t) => { t.seconds = -(2n ** 63n) - 1n; }],
+    [() => new Timestamp(0), (t) => { t.seconds = 5; }],
+    [() => new Timestamp(0), (t) => { t.nanoseconds = 1.9; }],
+    [() => new Timestamp(0), (t) => { t.nanoseconds = 1e9; }],
+    [() => new Timestamp(0), (t) => { t.nanoseconds = 2 ** 32 + 1; }],
+    [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = 65536 + 60; }],
+    [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = 1081; }],
+    [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = '60'; }],
+    [() => new Ext(1, [1]), (e) => { e.type = 300; }],
+    [() => new Ext(1, [1]), (e) => { e.type = -129; }],
+    [() => new Ext(1, [1]), (e) => { e.type = 1.5; }],
+    [() => new Ext(1, [1]), (e) => { e.type = '1'; }],
+  ];
+  for (const [make, mutate] of mutations) {
+    const v = make();
+    mutate(v);
+    const what = `${v.constructor.name} ${mutate}`;
+    assert.equal(code(() => encode(v)), 'invalid_argument', what);
+    assert.equal(code(() => encode([{ v }, { v }])), 'invalid_argument', what);
+    await assert.rejects(encodeAsync(v), (e) => e instanceof BtoonError && e.code === 'invalid_argument', what);
+  }
+});
+
+// Node-API's napi_get_prototype never runs a Proxy's getPrototypeOf trap and reports null for
+// every Proxy, so each one encoded as a plain object: a proxied [10, 20, 30] (Vue's ref(), MobX
+// observable arrays) became {"0": 10, ...}, a reactive Map {}, and a proxied class instance
+// skipped its prototype toJSON(). Proxies now encode like their targets, as in @btoon/js.
+test('Proxy-wrapped arrays, Maps and class instances encode like their targets', () => {
+  const same = (v, expected) => assert.equal(encode(v).toString('hex'), encode(expected).toString('hex'));
+  same(new Proxy([10, 20, 30], {}), [10, 20, 30]);
+  same(new Proxy([], {}), []);
+  same(new Proxy(new Proxy([1, [2]], {}), {}), [1, [2]]);
+  same(new Proxy([1, 2], { getPrototypeOf: () => Object.prototype }), [1, 2]); // Array.isArray decides
+  same({ list: new Proxy(['a', 'b'], {}) }, { list: ['a', 'b'] });
+  same(new Proxy(ROWS, {}), ROWS); // still tabular
+  same(ROWS.map((row) => new Proxy(row, {})), ROWS);
+  // Vue's and MobX's reactive Maps trap `get` and run the Map methods on the target.
+  const reactive = (target) =>
+    new Proxy(target, {
+      get(t, key) {
+        const v = Reflect.get(t, key, t);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    });
+  same(reactive(new Map([['b', 1], ['a', [2]]])), { a: [2], b: 1 });
+  same([reactive(new Map([['k', 1]])), reactive(new Map([['k', 2]]))], [{ k: 1 }, { k: 2 }]);
+  class Secret {
+    constructor() {
+      this.secret = 's';
+    }
+    toJSON() {
+      return 'public';
+    }
+  }
+  same(new Proxy(new Secret(), {}), 'public');
+  same(new Proxy({ b: 1, a: 2 }, {}), { a: 2, b: 1 });
+  same(Object.assign(Object.create(null), { b: 1, a: 2 }), { a: 2, b: 1 }); // still a plain object
+  // A bare Proxy of a Map can't run Map methods, and a Proxy of a Date has no time value: these
+  // throw (as in @btoon/js) instead of encoding as {}.
+  assert.throws(() => encode(new Proxy(new Map([['a', 1]]), {})), TypeError);
+  assert.equal(code(() => encode(new Proxy(new Date(0), {}))), 'invalid_argument');
+  const { proxy, revoke } = Proxy.revocable([1], {});
+  revoke();
+  assert.throws(() => encode(proxy), TypeError);
+});
+
+// SPEC §8: an empty key is a misconfiguration, not "no key" (core signs and verifies nothing
+// with an empty key). Every entry point rejects one; only an absent key means no HMAC.
+test('an empty hmacKey is invalid_argument on every entry point; undefined means no key', async () => {
+  const doc = encode({ a: 1 });
+  const sealed = encode({ a: 1 }, { hmacKey: 'k'.repeat(32) });
+  for (const hmacKey of ['', new Uint8Array(0), Buffer.alloc(0), new Uint8Array(new ArrayBuffer(8), 8)]) {
+    const isInvalid = (e) => e instanceof BtoonError && e.code === 'invalid_argument';
+    assert.equal(code(() => encode({ a: 1 }, { hmacKey })), 'invalid_argument');
+    assert.equal(code(() => decode(doc, { hmacKey })), 'invalid_argument');
+    assert.equal(code(() => decode(sealed, { hmacKey })), 'invalid_argument');
+    await assert.rejects(encodeAsync({ a: 1 }, { hmacKey }), isInvalid);
+    await assert.rejects(decodeAsync(doc, { hmacKey }), isInvalid);
+    await assert.rejects(decodeAsync(sealed, { hmacKey }), isInvalid);
+  }
+  assert.deepStrictEqual(encode({ a: 1 }, { hmacKey: undefined }), doc);
+  assert.deepStrictEqual(decode(doc, { hmacKey: undefined }), { a: 1 });
+  assert.equal(code(() => decode(sealed, { hmacKey: undefined })), 'authentication_failed');
+});
+
+// A string key is used as its UTF-8 bytes, and UTF-8 has no form for a lone surrogate:
+// Buffer.from wrote U+FFFD instead, so 'k\ud800', 'k\udfff' and 'k�' were one key, and
+// each verified documents signed with the others. Like @btoon/js, such a key is invalid_argument.
+test('an hmacKey string with a lone surrogate is invalid_argument on every entry point', async () => {
+  const sealed = encode({ a: 1 }, { hmacKey: 'k�' });
+  const isInvalid = (e) => e instanceof BtoonError && e.code === 'invalid_argument' && e.message === 'hmacKey string contains a lone surrogate';
+  for (const hmacKey of ['k\ud800', 'k\udfff', '\udc00k', 'a\ud83db', '\ud800𐀀', 'x'.repeat(100) + '\udbff']) {
+    assert.throws(() => encode({ a: 1 }, { hmacKey }), isInvalid);
+    assert.throws(() => decode(sealed, { hmacKey }), isInvalid);
+    await assert.rejects(encodeAsync({ a: 1 }, { hmacKey }), isInvalid);
+    await assert.rejects(decodeAsync(sealed, { hmacKey }), isInvalid);
+  }
+  // Well-formed keys work, astral characters and a real U+FFFD included.
+  for (const hmacKey of ['k�', 'key 😀', 'ключ']) {
+    assert.deepStrictEqual(decode(encode({ a: 1 }, { hmacKey }), { hmacKey }), { a: 1 });
+    assert.deepStrictEqual(await decodeAsync(await encodeAsync({ a: 1 }, { hmacKey }), { hmacKey }), { a: 1 });
+  }
+});

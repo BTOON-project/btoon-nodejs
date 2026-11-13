@@ -37,8 +37,18 @@ npm run examples
 - Safe integers become ints, everything else float64.
 - Class instances follow `JSON.stringify` (`toJSON`, own enumerable props).
 - `"__proto__"` becomes an own property.
-- An empty `hmacKey` is `invalid_argument`.
+- An empty `hmacKey`, or a string one with a lone surrogate, is `invalid_argument`
+  (UTF-8 would make it U+FFFD, a key collision). `null` still means no key until D25.
 - A string with a lone surrogate is `invalid_utf8` (napi would silently write U+FFFD).
+- A Proxy encodes like its target. `napi_get_prototype` reports null for every Proxy, so a
+  null prototype is classified in JS (`proxyKind` in index.js: `Array.isArray`,
+  `Object.getPrototypeOf`).
+- With `timestamps: 'date'`, an instant outside Date's range (±8.64e15 ms) decodes to a
+  `Timestamp`, never `Invalid Date`.
+- `Timestamp` and `Ext` fields out of range are `invalid_argument`, in the constructors and
+  again in `encode` (the fields are writable). Never let a napi conversion wrap.
+- Linux glibc prebuilds are built in manylinux_2_28 (`scripts/prebuild-linux.sh`) and must
+  need at most GLIBC 2.28 / GLIBCXX 3.4.25 (`scripts/check-glibc.sh`).
 
 Known: the native path is 2.5–3.5× slower than pure-JS MessagePack libraries (Node-API
 call overhead). See the README Performance section.

@@ -1,7 +1,9 @@
 name: Release
 
 # On a version tag: build Node-API prebuilds for every platform, verify each one loads
-# and passes the tests, then publish to npm with provenance.
+# and passes the tests, load-test the packed package on the Linux distros people deploy
+# on, then publish to npm with provenance. Run it by hand (workflow_dispatch) to build and
+# test without publishing.
 on:
   push:
     tags: ['v*']
@@ -11,6 +13,31 @@ permissions:
   contents: read
 
 jobs:
+  # Linux glibc prebuilds are built in manylinux_2_28 (AlmaLinux 8: glibc 2.28, gcc-toolset),
+  # the floor of Node.js's own Linux builds. Built on the Ubuntu 24.04 runners they needed
+  # GLIBC_2.38 and didn't load on Debian 12, Ubuntu 22.04, RHEL 9 or Amazon Linux 2023.
+  # scripts/prebuild-linux.sh installs Node.js, builds, fails if the binary needs symbol
+  # versions above GLIBC 2.28, GLIBCXX 3.4.25 or CXXABI 1.3.11, and runs the tests on it.
+  prebuild-glibc:
+    name: prebuild (linux-${{ matrix.arch }}, manylinux_2_28)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, os: ubuntu-latest, image: 'quay.io/pypa/manylinux_2_28_x86_64' }
+          - { arch: arm64, os: ubuntu-24.04-arm, image: 'quay.io/pypa/manylinux_2_28_aarch64' }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build, check symbol versions and test (in ${{ matrix.image }})
+        run: docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" bash scripts/prebuild-linux.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prebuilds-linux-${{ matrix.arch }}
+          path: prebuilds/
+
   prebuild:
     name: prebuild (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -19,8 +46,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64, os: ubuntu-latest }
-          - { name: linux-arm64, os: ubuntu-24.04-arm }
           - { name: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine' }
           - { name: darwin-arm64, os: macos-latest }
           - { name: darwin-x64, os: macos-latest, arch: x64 }
@@ -54,8 +79,47 @@ jobs:
           name: prebuilds-${{ matrix.name }}
           path: prebuilds/
 
+  # Installs the packed package without install scripts, so nothing gets compiled, and
+  # checks that the shipped prebuild loads and round-trips a document. Images without
+  # Node.js get the official build from nodejs.org.
+  load-test:
+    name: load (${{ matrix.image }}, ${{ matrix.arch }})
+    needs: [prebuild-glibc, prebuild]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        # glibc 2.31, 2.36, 2.35, 2.28 (RHEL 8) and 2.34 (also AWS Lambda's nodejs22.x)
+        image: ['node:22-bullseye', 'node:22-bookworm', 'ubuntu:22.04', 'almalinux:8', 'amazonlinux:2023']
+        include:
+          - { arch: x64, image: 'node:22-alpine' } # musl; that prebuild is x64 only
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: prebuilds-*
+          path: prebuilds
+          merge-multiple: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Pack
+        run: npm pack && mv btoon-*.tgz btoon.tgz
+      - name: Node.js for images without one
+        run: bash scripts/fetch-node.sh "$RUNNER_TEMP/node"
+      - name: Load and round-trip (in ${{ matrix.image }})
+        run: >-
+          docker run --rm
+          -v "$PWD/btoon.tgz:/pkg/btoon.tgz:ro"
+          -v "$PWD/scripts/load-test.sh:/load-test.sh:ro"
+          -v "$RUNNER_TEMP/node:/opt/node:ro"
+          "${{ matrix.image }}" sh /load-test.sh /pkg/btoon.tgz
+
   publish:
-    needs: prebuild
+    needs: [prebuild-glibc, prebuild, load-test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: npm
