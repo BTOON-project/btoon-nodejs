@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.2 (2026-11-13)
+
+- **Core:** built on btoon-core 0.1.5. Nested containers no longer reserve memory against
+  the same input at every level. On the review's inputs, 1 MiB of nested headers reserved
+  5 GB on 0.1.4; now it peaks near 100 MB.
+- **Fixed (packaging):** the Linux glibc prebuilds needed glibc 2.38 (`GLIBC_2.38`,
+  `GLIBCXX_3.4.32`) because they were built on Ubuntu 24.04. They didn't load on Debian 12
+  (the default `node:22` images), Ubuntu 22.04, RHEL 9 or Amazon Linux 2023 / AWS Lambda.
+  They're now built in the manylinux_2_28 images and need glibc 2.28, like Node.js's own
+  Linux builds. The release workflow checks the symbol versions and load-tests the package
+  on Debian 11 and 12, Ubuntu 22.04, AlmaLinux 8, Amazon Linux 2023 and Alpine.
+- **Fixed:** with the default `timestamps: 'date'`, an instant outside the range of `Date`
+  (±8.64e15 ms) decoded to `Invalid Date`, losing the value. Documents from other libraries
+  carry such instants, for example an INT64_MAX "never" sentinel or seconds = 1e13. They
+  now decode to a `Timestamp`, as in `@btoon/js`. **Behavior change:** for those instants
+  `decode` returns a `Timestamp`, not a `Date`.
+- **Fixed:** `Timestamp` accepted seconds outside the int64 range, and `encode` wrapped them
+  silently: `new Timestamp(2n ** 64n)` encoded as the epoch, `2n ** 63n` as -2^63.
+  Nanoseconds, offsets and `Ext` types assigned after construction wrapped the same way
+  (`Ext` type 300 became 44). The constructors and `encode` now reject them with
+  `BtoonError` code `invalid_argument`, as `@btoon/js` does. **Behavior changes:**
+  - `new Timestamp()`, `new Ext()` and `Timestamp.fromDate(invalidDate)` throw `BtoonError`
+    (`invalid_argument`) where they threw `RangeError` (or `BigInt()`'s `TypeError` or
+    `SyntaxError` for seconds that aren't a number).
+  - `timestamp.toDate()` throws `BtoonError` (`invalid_argument`) outside the range of
+    `Date`, where it returned `Invalid Date`.
+- **Fixed:** every `Proxy` encoded as a plain object, because Node-API reports a null
+  prototype for any Proxy. This hit Vue and MobX reactive state: a proxied `[10, 20, 30]`
+  became `{"0": 10, "1": 20, "2": 30}`, a reactive `Map` became `{}`, and a proxied class
+  instance skipped its prototype's `toJSON()`. Proxies now encode like their targets; as in
+  `@btoon/js`, `Array.isArray` and `Object.getPrototypeOf` decide. A bare `Proxy` of a
+  `Map`, whose methods can't run on the proxy, now throws the Map method's `TypeError`, and
+  a `Proxy` of a `Date` throws `invalid_argument`. Both encoded as `{}` before. Encoding
+  plain objects and arrays costs the same as before.
+- **Fixed:** an `hmacKey` string with a lone surrogate was signed with U+FFFD in its place,
+  so `'k\ud800'`, `'k\udfff'` and `'k�'` were one key, and each one verified documents
+  signed with the others. **Behavior change:** such a key now throws `BtoonError`
+  `invalid_argument` on `encode`, `decode`, `encodeAsync` and `decodeAsync`, as in
+  `@btoon/js`.
+
 ## 0.1.1 (2026-11-13)
 
 - **Fixed (crashes):**

@@ -18,8 +18,9 @@ npm install btoon
 ```
 
 Prebuilt binaries (Node-API, Node ≥ 18) ship for Linux x64 (glibc and musl), Linux arm64 (glibc), macOS
-arm64/x64 and Windows x64. On other platforms npm builds from source, which needs a C++20
-compiler and Python for node-gyp.
+arm64/x64 and Windows x64. The glibc ones need glibc 2.28 or newer, like Node.js's own Linux builds:
+RHEL 8, Debian 10, Ubuntu 20.04 and Amazon Linux 2023 (AWS Lambda's `nodejs20.x` and later) all qualify.
+On other platforms npm builds from source, which needs a C++20 compiler and Python for node-gyp.
 
 ## Usage
 
@@ -48,8 +49,8 @@ await btoon.decodeAsync(bytes);             // parsing runs on the libuv thread 
 | `bigint` | Uses 64-bit ints when it fits, the bigint extension otherwise. Decodes to `bigint` beyond `Number.MAX_SAFE_INTEGER` (or always, with `bigint: 'always'`). |
 | `Buffer`, `Uint8Array`, other typed arrays, `ArrayBuffer`, `DataView` → `Buffer` | |
 | `Float32Array`, `Float64Array` | Packed float vectors (little-endian); embeddings take 4 bytes per value |
-| `Date` → `Date` | `Timestamp` keeps nanoseconds and a UTC offset (`timestamps: 'object'`) |
-| arrays, plain objects, `Map` (string keys), class instances | Like `JSON.stringify`: own enumerable properties, and `toJSON()` is honored. Keys are written in UTF-8 byte order. |
+| `Date` → `Date` | `Timestamp` keeps nanoseconds and a UTC offset (`timestamps: 'object'`). Instants outside the range of `Date` decode as `Timestamp` |
+| arrays, plain objects, `Map` (string keys), class instances | Like `JSON.stringify`: own enumerable properties, and `toJSON()` is honored. Keys are written in UTF-8 byte order. Proxies of these (Vue and MobX reactive state) encode like their targets |
 | `Ext(type, data)` | Any other extension type |
 
 Functions and symbols throw `BtoonError` with `code: 'invalid_argument'`. Cycles throw

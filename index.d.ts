@@ -31,6 +31,7 @@ export declare class BtoonError extends Error {
 
 /** An extension value BTOON doesn't interpret. */
 export declare class Ext {
+  /** @throws {BtoonError} `invalid_argument` unless `type` is an integer in [-128, 127]. */
   constructor(type: number, data: Uint8Array | ArrayLike<number>);
   readonly type: number;
   readonly data: Uint8Array;
@@ -38,11 +39,22 @@ export declare class Ext {
 
 /** Nanosecond-precision instant with an optional UTC offset in minutes. */
 export declare class Timestamp {
+  /**
+   * @param seconds Seconds since the Unix epoch (UTC); must fit in a signed 64-bit integer.
+   * @param nanoseconds An integer in [0, 999999999] (default 0).
+   * @param offsetMinutes An integer in [-1080, 1080], or undefined for none.
+   * @throws {BtoonError} `invalid_argument` if a field is out of range.
+   */
   constructor(seconds: bigint | number, nanoseconds?: number, offsetMinutes?: number);
   readonly seconds: bigint;
   readonly nanoseconds: number;
   readonly offsetMinutes: number | undefined;
+  /**
+   * Millisecond-precision Date (the offset is dropped).
+   * @throws {BtoonError} `invalid_argument` outside the range of Date (±8.64e15 ms).
+   */
   toDate(): Date;
+  /** @throws {BtoonError} `invalid_argument` for an invalid Date. */
   static fromDate(date: Date): Timestamp;
 }
 
@@ -55,7 +67,10 @@ export interface EncodeOptions {
   autoTabular?: boolean;
   /** Nesting limit (default 128); cycles fail with code 'max_depth'. */
   maxDepth?: number;
-  /** Sign with HMAC-SHA256 (strings are UTF-8 encoded). */
+  /**
+   * Sign with HMAC-SHA256. A string is used as its UTF-8 bytes. An empty key, or a string
+   * with a lone surrogate, throws 'invalid_argument'.
+   */
   hmacKey?: Uint8Array | string;
 }
 
@@ -67,9 +82,12 @@ export interface DecodeOptions {
   maxDecompressedSize?: number;
   /** Accept compression envelopes (default true). */
   autoDecompress?: boolean;
-  /** Require and verify an HMAC-SHA256 signature. */
+  /** Require and verify an HMAC-SHA256 signature. The key's rules are as for encode. */
   hmacKey?: Uint8Array | string;
-  /** 'date' (default, millisecond Date) or 'object' (Timestamp, lossless). */
+  /**
+   * 'date' (default): a millisecond Date, or a Timestamp for an instant outside the range of
+   * Date. 'object': always a Timestamp (lossless).
+   */
   timestamps?: 'date' | 'object';
   /** 'auto' (default: bigint only beyond Number.MAX_SAFE_INTEGER) or 'always'. */
   bigint?: 'auto' | 'always';
@@ -79,7 +97,8 @@ export interface DecodeOptions {
  * Values that encode: null/undefined, boolean, number, bigint, string, Uint8Array/Buffer/
  * ArrayBuffer/DataView/other typed arrays (binary), Float32Array/Float64Array (vectors),
  * Date, Timestamp, Ext, arrays, Maps with string keys and objects (own enumerable
- * string-keyed properties; toJSON() is honored).
+ * string-keyed properties; toJSON() is honored). Proxied arrays, objects and class
+ * instances, and reactive Maps (Vue, MobX), encode like their targets.
  */
 export type Encodable = unknown;
 
