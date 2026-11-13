@@ -5,6 +5,12 @@
 // (no intermediate tree); bytes are decoded by btoon-core's hardened decoder
 // into a btoon::Value and then converted to JS. The JS-facing classes
 // (BtoonError, Ext, Timestamp) are defined in index.js and passed to setup().
+
+// While a worker thread is being terminated, Node-API can neither call into JS nor throw.
+// AsyncWorker callbacks that finish then (OnOK/OnError) fail, and without this node-addon-api
+// rethrew the failure out of the libuv callback, where it ended in std::terminate and took
+// the whole process down. With it, an exception that can't be thrown is dropped.
+#define NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS
 #include <napi.h>
 
 #include <algorithm>
@@ -24,7 +30,7 @@ using namespace btoon;
 namespace {
 
 struct AddonData {
-    Napi::FunctionReference BtoonError, Ext, Timestamp, MapCtor, ArrayFrom;
+    Napi::FunctionReference BtoonError, Ext, Timestamp, MapCtor, ArrayFrom, TypedArrayByteLength;
     Napi::ObjectReference ObjectPrototype;
 };
 
@@ -38,6 +44,79 @@ AddonData* data_of(Napi::Env env) {
 [[noreturn]] void throw_btoon(Napi::Env env, const char* code, const std::string& message) {
     Napi::Value err = data_of(env)->BtoonError.New({Napi::String::New(env, code), Napi::String::New(env, message)});
     throw Napi::Error(env, err);
+}
+
+// Turns a failed Node-API call into a C++ exception. When the call ran JS that threw (a getter,
+// a Proxy trap, toJSON), the pending JS exception is what gets rethrown. A failed call leaves
+// its outputs unwritten, so they must never be used: an uninitialized napi_value from a
+// throwing getter used to crash the process.
+void check(Napi::Env env, napi_status status) {
+    if (status != napi_ok) throw Napi::Error::New(env);
+}
+
+// --- typed arrays ---------------------------------------------------------------------------
+
+// The bytes of a typed array. node-addon-api's TypedArray::ByteLength() multiplies the length
+// by an element size from its own table, which lacks newer types: a Float16Array came out
+// empty on Node 24+, and as half its bytes on Node 22 (whose napi leaves the type unset). So
+// the type is read with an "unknown" default, and the size of a type napi doesn't name comes
+// from the %TypedArray%.prototype.byteLength getter, which user code can't shadow.
+// kOtherTypedArray is the "unset" default: 15 is in the enum's range but names no type.
+constexpr auto kOtherTypedArray = static_cast<napi_typedarray_type>(15);
+
+struct TypedBytes {
+    napi_typedarray_type type;  // kOtherTypedArray if this napi doesn't name it
+    size_t length;              // elements
+    std::span<const uint8_t> bytes;
+};
+
+size_t element_size(napi_typedarray_type type) {
+    switch (type) {
+        case napi_int8_array:
+        case napi_uint8_array:
+        case napi_uint8_clamped_array: return 1;
+        case napi_int16_array:
+        case napi_uint16_array: return 2;
+        case napi_int32_array:
+        case napi_uint32_array:
+        case napi_float32_array: return 4;
+        case napi_float64_array:
+        case napi_bigint64_array:
+        case napi_biguint64_array: return 8;
+        default: return 0;
+    }
+}
+
+TypedBytes typed_array_bytes(Napi::Env env, napi_value ta) {
+    napi_typedarray_type type = kOtherTypedArray;
+    size_t length = 0;
+    void* data = nullptr;
+    check(env, napi_get_typedarray_info(env, ta, &type, &length, &data, nullptr, nullptr));
+    size_t size = element_size(type);
+    size_t n = length * size;
+    if (size == 0) {
+        type = kOtherTypedArray;
+        Napi::Value bl = data_of(env)->TypedArrayByteLength.Call(ta, {});
+        n = static_cast<size_t>(bl.As<Napi::Number>().Int64Value());
+    }
+    if (n == 0 || data == nullptr) return {type, length, {}};
+    return {type, length, {static_cast<const uint8_t*>(data), n}};
+}
+
+std::span<const uint8_t> dataview_bytes(Napi::Env env, napi_value dv) {
+    size_t n = 0;
+    void* data = nullptr;
+    check(env, napi_get_dataview_info(env, dv, &n, &data, nullptr, nullptr));
+    if (n == 0 || data == nullptr) return {};
+    return {static_cast<const uint8_t*>(data), n};
+}
+
+std::span<const uint8_t> arraybuffer_bytes(Napi::Env env, napi_value ab) {
+    size_t n = 0;
+    void* data = nullptr;
+    check(env, napi_get_arraybuffer_info(env, ab, &data, &n));
+    if (n == 0 || data == nullptr) return {};
+    return {static_cast<const uint8_t*>(data), n};
 }
 
 // --- JS -> bytes ------------------------------------------------------------------------
@@ -87,13 +166,11 @@ private:
     std::string_view utf8(Napi::Value s) {
         if (scratch_.size() < 4096) scratch_.resize(4096);
         size_t len = 0;
-        if (napi_get_value_string_utf8(env_, s, scratch_.data(), scratch_.size(), &len) != napi_ok) {
-            throw Napi::Error::New(env_, "btoon: failed to read string");
-        }
+        check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), scratch_.size(), &len));
         if (len + 5 > scratch_.size()) {
-            napi_get_value_string_utf8(env_, s, nullptr, 0, &len);
+            check(env_, napi_get_value_string_utf8(env_, s, nullptr, 0, &len));
             scratch_.resize(len + 1);
-            napi_get_value_string_utf8(env_, s, scratch_.data(), len + 1, &len);
+            check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), len + 1, &len));
         }
         std::string_view out{scratch_.data(), len};
         check_well_formed(s, out);
@@ -106,9 +183,9 @@ private:
     void check_well_formed(Napi::Value s, std::string_view u8) {
         if (u8.find("\xEF\xBF\xBD") == std::string_view::npos) return;
         size_t n = 0;
-        napi_get_value_string_utf16(env_, s, nullptr, 0, &n);
+        check(env_, napi_get_value_string_utf16(env_, s, nullptr, 0, &n));
         std::u16string u16(n + 1, u'\0');
-        napi_get_value_string_utf16(env_, s, u16.data(), n + 1, &n);
+        check(env_, napi_get_value_string_utf16(env_, s, u16.data(), n + 1, &n));
         for (size_t i = 0; i < n; ++i) {
             const char16_t c = u16[i];
             if (c < 0xD800 || c > 0xDFFF) continue;
@@ -157,7 +234,7 @@ private:
 
     bool instance_of(Napi::Object o, Napi::FunctionReference& ctor) {
         bool result = false;
-        napi_instanceof(env_, o, ctor.Value(), &result);
+        check(env_, napi_instanceof(env_, o, ctor.Value(), &result));  // a Proxy's getPrototypeOf trap can throw
         return result;
     }
 
@@ -166,30 +243,29 @@ private:
     // Plain objects ({} literals, Object.create(null)) skip the exotic-type checks entirely.
     bool is_plain(Napi::Object o) {
         napi_value proto;
-        if (napi_get_prototype(env_, o, &proto) != napi_ok) return false;
+        check(env_, napi_get_prototype(env_, o, &proto));  // a Proxy's getPrototypeOf trap can throw
         napi_valuetype t;
-        napi_typeof(env_, proto, &t);
+        check(env_, napi_typeof(env_, proto, &t));
         if (t == napi_null) return true;
         bool eq = false;
-        napi_strict_equals(env_, proto, d_->ObjectPrototype.Value(), &eq);
+        check(env_, napi_strict_equals(env_, proto, d_->ObjectPrototype.Value(), &eq));
         return eq;
     }
 
+    // Getters and Proxy traps run here and may throw; their exception is rethrown as is.
     Entries own_entries(Napi::Object o) {
         napi_value names;
-        if (napi_get_all_property_names(env_, o, napi_key_own_only,
-                                        static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
-                                        napi_key_numbers_to_strings, &names) != napi_ok) {
-            throw Napi::Error::New(env_, "btoon: failed to enumerate object properties");
-        }
+        check(env_, napi_get_all_property_names(env_, o, napi_key_own_only,
+                                                static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                                                napi_key_numbers_to_strings, &names));
         uint32_t n = 0;
-        napi_get_array_length(env_, names, &n);
+        check(env_, napi_get_array_length(env_, names, &n));
         Entries out;
         out.reserve(n);
         for (uint32_t i = 0; i < n; ++i) {
             napi_value k, val;
-            napi_get_element(env_, names, i, &k);
-            napi_get_property(env_, o, k, &val);
+            check(env_, napi_get_element(env_, names, i, &k));
+            check(env_, napi_get_property(env_, o, k, &val));
             out.push_back({utf8_copy(Napi::Value(env_, k)), Napi::Value(env_, val)});
         }
         sort(out);
@@ -203,7 +279,7 @@ private:
         if (is_plain(o)) {
             bool has_to_json = false;
             napi_value key = Napi::String::New(env_, "toJSON");
-            napi_has_own_property(env_, o, key, &has_to_json);
+            check(env_, napi_has_own_property(env_, o, key, &has_to_json));
             if (has_to_json) {
                 Napi::Value fn = o.Get(key);
                 if (fn.IsFunction()) {
@@ -251,26 +327,17 @@ private:
         }
     }
 
+    // Float32Array and Float64Array are vectors; every other view is binary, with its bytes as
+    // they are in memory (a Float16Array included).
     void encode_bytes(Napi::Object o) {
         if (o.IsTypedArray()) {
-            Napi::TypedArray ta = o.As<Napi::TypedArray>();
-            napi_typedarray_type type = ta.TypedArrayType();
-            const uint8_t* base = static_cast<const uint8_t*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
-            if (type == napi_float32_array) {
-                return encode_vector<float>(base, ta.ElementLength());
-            }
-            if (type == napi_float64_array) {
-                return encode_vector<double>(base, ta.ElementLength());
-            }
-            return enc_.encodeBinary({base, ta.ByteLength()});
+            TypedBytes t = typed_array_bytes(env_, o);
+            if (t.type == napi_float32_array) return encode_vector<float>(t.bytes.data(), t.length);
+            if (t.type == napi_float64_array) return encode_vector<double>(t.bytes.data(), t.length);
+            return enc_.encodeBinary(t.bytes);
         }
-        if (o.IsDataView()) {
-            Napi::DataView dv = o.As<Napi::DataView>();
-            const auto* base = static_cast<const uint8_t*>(dv.ArrayBuffer().Data()) + dv.ByteOffset();
-            return enc_.encodeBinary({base, dv.ByteLength()});
-        }
-        Napi::ArrayBuffer ab = o.As<Napi::ArrayBuffer>();
-        enc_.encodeBinary({static_cast<const uint8_t*>(ab.Data()), ab.ByteLength()});
+        if (o.IsDataView()) return enc_.encodeBinary(dataview_bytes(env_, o));
+        enc_.encodeBinary(arraybuffer_bytes(env_, o));
     }
 
     template <class T>
@@ -302,9 +369,9 @@ private:
         }
         if (instance_of(o, d_->Ext)) {
             int type = o.Get("type").As<Napi::Number>().Int32Value();
-            Napi::TypedArray bytes = o.Get("data").As<Napi::TypedArray>();
-            const auto* base = static_cast<const uint8_t*>(bytes.ArrayBuffer().Data()) + bytes.ByteOffset();
-            return enc_.encodeExtension(static_cast<int8_t>(type), {base, bytes.ByteLength()});
+            Napi::Value data = o.Get("data");
+            if (!data.IsTypedArray()) throw_btoon(env_, "invalid_argument", "Ext data must be a Uint8Array");
+            return enc_.encodeExtension(static_cast<int8_t>(type), typed_array_bytes(env_, data).bytes);
         }
         if (instance_of(o, d_->Timestamp)) {
             bool lossless = false;
@@ -505,10 +572,8 @@ Napi::Value to_js(DecodeCtx& c, const Value& v) {
                 props[i++] = {nullptr, key, nullptr, nullptr, nullptr, to_js(c, e), napi_default_jsproperty, nullptr};
             }
             napi_value out;
-            napi_create_object(c.env, &out);
-            if (!props.empty() && napi_define_properties(c.env, out, props.size(), props.data()) != napi_ok) {
-                throw Napi::Error::New(c.env, "btoon: failed to build object");
-            }
+            check(c.env, napi_create_object(c.env, &out));
+            if (!props.empty()) check(c.env, napi_define_properties(c.env, out, props.size(), props.data()));
             return Napi::Value(c.env, out);
         }
         case 9: {
@@ -553,11 +618,11 @@ CompressionAlgorithm parse_algorithm(Napi::Env env, const std::string& name) {
     throw_btoon(env, "invalid_argument", "unknown compression algorithm: '" + name + "'");
 }
 
-std::string bytes_option(Napi::Value v) {
+std::string bytes_option(Napi::Env env, Napi::Value v) {
     if (v.IsUndefined() || v.IsNull()) return {};
-    Napi::TypedArray ta = v.As<Napi::TypedArray>();
-    const auto* base = static_cast<const char*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
-    return std::string(base, ta.ByteLength());
+    if (!v.IsTypedArray()) throw_btoon(env, "invalid_argument", "hmacKey must be a Uint8Array");
+    auto bytes = typed_array_bytes(env, v).bytes;
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
@@ -566,18 +631,18 @@ EncodeOptions encode_options(Napi::Env env, Napi::Object o) {
     opts.compression_algorithm = parse_algorithm(env, o.Get("compression").As<Napi::String>().Utf8Value());
     opts.auto_tabular = o.Get("autoTabular").ToBoolean().Value();
     opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
-    opts.hmac_key = bytes_option(o.Get("hmacKey"));
+    opts.hmac_key = bytes_option(env, o.Get("hmacKey"));
     opts.validate_utf8 = false;  // N-API strings are always well-formed UTF-8
     return opts;
 }
 
-DecodeOptions decode_options(Napi::Object o) {
+DecodeOptions decode_options(Napi::Env env, Napi::Object o) {
     DecodeOptions opts;
     opts.strict = o.Get("strict").ToBoolean().Value();
     opts.max_depth = static_cast<size_t>(o.Get("maxDepth").As<Napi::Number>().Int64Value());
     opts.max_decompressed_size = static_cast<size_t>(o.Get("maxDecompressedSize").As<Napi::Number>().Int64Value());
     opts.auto_decompress = o.Get("autoDecompress").ToBoolean().Value();
-    opts.hmac_key = bytes_option(o.Get("hmacKey"));
+    opts.hmac_key = bytes_option(env, o.Get("hmacKey"));
     return opts;
 }
 
@@ -593,18 +658,9 @@ std::vector<uint8_t> encode_bare(Napi::Env env, Napi::Value value, const EncodeO
 }
 
 std::span<const uint8_t> input_bytes(Napi::Env env, Napi::Value v) {
-    if (v.IsTypedArray()) {
-        Napi::TypedArray ta = v.As<Napi::TypedArray>();
-        return {static_cast<const uint8_t*>(ta.ArrayBuffer().Data()) + ta.ByteOffset(), ta.ByteLength()};
-    }
-    if (v.IsArrayBuffer()) {
-        Napi::ArrayBuffer ab = v.As<Napi::ArrayBuffer>();
-        return {static_cast<const uint8_t*>(ab.Data()), ab.ByteLength()};
-    }
-    if (v.IsDataView()) {
-        Napi::DataView dv = v.As<Napi::DataView>();
-        return {static_cast<const uint8_t*>(dv.ArrayBuffer().Data()) + dv.ByteOffset(), dv.ByteLength()};
-    }
+    if (v.IsTypedArray()) return typed_array_bytes(env, v).bytes;
+    if (v.IsArrayBuffer()) return arraybuffer_bytes(env, v);
+    if (v.IsDataView()) return dataview_bytes(env, v);
     throw_btoon(env, "invalid_argument", "decode expects a Uint8Array, Buffer, ArrayBuffer or DataView");
 }
 
@@ -639,15 +695,25 @@ Napi::Value Encode(const Napi::CallbackInfo& info) {
     return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
 }
 
-DecodeCtx make_ctx(Napi::Env env, Napi::Object o) {
-    return DecodeCtx{env, data_of(env), o.Get("timestamps").As<Napi::String>().Utf8Value() == "object",
-                     o.Get("bigint").As<Napi::String>().Utf8Value() == "always", {}};
+// The options that shape decode's JS output, read once on the main thread.
+struct OutputOptions {
+    bool timestamps_as_objects;
+    bool bigint_always;
+};
+
+OutputOptions output_options(Napi::Object o) {
+    return {o.Get("timestamps").As<Napi::String>().Utf8Value() == "object",
+            o.Get("bigint").As<Napi::String>().Utf8Value() == "always"};
+}
+
+DecodeCtx make_ctx(Napi::Env env, OutputOptions o) {
+    return DecodeCtx{env, data_of(env), o.timestamps_as_objects, o.bigint_always, {}};
 }
 
 Napi::Value Decode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Object o = info[1].As<Napi::Object>();
-    DecodeOptions opts = decode_options(o);
+    DecodeOptions opts = decode_options(env, o);
     std::span<const uint8_t> in = input_bytes(env, info[0]);
     Value value;
     try {
@@ -655,16 +721,40 @@ Napi::Value Decode(const Napi::CallbackInfo& info) {
     } catch (const BtoonException& e) {
         throw_btoon(env, e.code_name(), e.what());
     }
-    DecodeCtx ctx = make_ctx(env, o);
+    DecodeCtx ctx = make_ctx(env, output_options(o));
     return to_js(ctx, value);
 }
 
-// decodeAsync: parse on the libuv thread pool, convert on the main thread.
+// Settles an async call's promise from OnOK/OnError. If the result can't be converted (e.g.
+// out of memory), the promise is rejected instead. While the environment is being torn down
+// (worker.terminate()) nothing can run: the resulting Napi::Error reaches node-addon-api,
+// which drops it (NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS) and the promise is never settled.
+template <class F>
+void settle(Napi::Env env, Napi::Promise::Deferred& deferred, F&& resolve) {
+    try {
+        resolve();
+    } catch (const Napi::Error& e) {
+        deferred.Reject(e.Value());
+    } catch (const std::exception& e) {
+        deferred.Reject(Napi::Error::New(env, std::string("btoon: ") + e.what()).Value());
+    }
+}
+
+// Rejects with a BtoonError carrying the spec error code the worker recorded.
+void reject_btoon(Napi::Env env, Napi::Promise::Deferred& deferred, const std::string& code, const Napi::Error& e) {
+    settle(env, deferred, [&] {
+        deferred.Reject(data_of(env)->BtoonError.New({Napi::String::New(env, code), e.Value().Get("message")}));
+    });
+}
+
+// decodeAsync: parse on the libuv thread pool, convert on the main thread. Everything the
+// worker needs is captured as plain values when it is queued, so its callbacks never read
+// JS objects (which may be gone by then).
 class DecodeWorker : public Napi::AsyncWorker {
 public:
-    DecodeWorker(Napi::Env env, std::vector<uint8_t> input, DecodeOptions opts, Napi::Object js_opts)
+    DecodeWorker(Napi::Env env, std::vector<uint8_t> input, DecodeOptions opts, OutputOptions output)
         : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)), input_(std::move(input)),
-          opts_(std::move(opts)), js_opts_(Napi::Persistent(js_opts)) {}
+          opts_(std::move(opts)), output_(output) {}
     Napi::Promise Promise() { return deferred_.Promise(); }
 
     void Execute() override {
@@ -677,23 +767,18 @@ public:
     }
     void OnOK() override {
         Napi::Env env = Env();
-        try {
-            DecodeCtx ctx = make_ctx(env, js_opts_.Value());
+        settle(env, deferred_, [&] {
+            DecodeCtx ctx = make_ctx(env, output_);
             deferred_.Resolve(to_js(ctx, value_));
-        } catch (const Napi::Error& e) {
-            deferred_.Reject(e.Value());
-        }
+        });
     }
-    void OnError(const Napi::Error& e) override {
-        Napi::Env env = Env();
-        deferred_.Reject(data_of(env)->BtoonError.New({Napi::String::New(env, code_), e.Value().Get("message")}));
-    }
+    void OnError(const Napi::Error& e) override { reject_btoon(Env(), deferred_, code_, e); }
 
 private:
     Napi::Promise::Deferred deferred_;
     std::vector<uint8_t> input_;
     DecodeOptions opts_;
-    Napi::ObjectReference js_opts_;
+    OutputOptions output_;
     Value value_;
     std::string code_ = "error";
 };
@@ -703,7 +788,8 @@ Napi::Value DecodeAsync(const Napi::CallbackInfo& info) {
     Napi::Object o = info[1].As<Napi::Object>();
     std::span<const uint8_t> in = input_bytes(env, info[0]);
     // Copy: the caller may mutate their buffer while we work off-thread.
-    auto* worker = new DecodeWorker(env, std::vector<uint8_t>(in.begin(), in.end()), decode_options(o), o);
+    auto* worker = new DecodeWorker(env, std::vector<uint8_t>(in.begin(), in.end()), decode_options(env, o),
+                                    output_options(o));
     Napi::Promise p = worker->Promise();
     worker->Queue();
     return p;
@@ -724,11 +810,10 @@ public:
             SetError(e.what());
         }
     }
-    void OnOK() override { deferred_.Resolve(Napi::Buffer<uint8_t>::Copy(Env(), bytes_.data(), bytes_.size())); }
-    void OnError(const Napi::Error& e) override {
-        Napi::Env env = Env();
-        deferred_.Reject(data_of(env)->BtoonError.New({Napi::String::New(env, code_), e.Value().Get("message")}));
+    void OnOK() override {
+        settle(Env(), deferred_, [&] { deferred_.Resolve(Napi::Buffer<uint8_t>::Copy(Env(), bytes_.data(), bytes_.size())); });
     }
+    void OnError(const Napi::Error& e) override { reject_btoon(Env(), deferred_, code_, e); }
 
 private:
     Napi::Promise::Deferred deferred_;
@@ -757,6 +842,7 @@ Napi::Value Setup(const Napi::CallbackInfo& info) {
     d->MapCtor = Napi::Persistent(o.Get("Map").As<Napi::Function>());
     d->ArrayFrom = Napi::Persistent(o.Get("arrayFrom").As<Napi::Function>());
     d->ObjectPrototype = Napi::Persistent(o.Get("objectPrototype").As<Napi::Object>());
+    d->TypedArrayByteLength = Napi::Persistent(o.Get("typedArrayByteLength").As<Napi::Function>());
     env.SetInstanceData(d);  // deleted with the environment (worker threads get their own)
     return env.Undefined();
 }

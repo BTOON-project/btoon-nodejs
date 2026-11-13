@@ -68,6 +68,98 @@ test('binary and typed arrays', () => {
   assert.deepStrictEqual([...rt(Buffer.from('hello'))], [...Buffer.from('hello')]);
 });
 
+// node-addon-api's TypedArray::ByteLength() didn't know Float16Array: it encoded as an empty
+// binary on Node 24+ and as half its bytes on Node 22 --js-float16array.
+test('every view encodes exactly its bytes, Float16Array included', () => {
+  const hex = (v) => Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString('hex');
+  for (const v of [new Int16Array([1, -1]), new Uint8ClampedArray([1, 2, 300]), new BigInt64Array([-1n]),
+    new Uint32Array(new ArrayBuffer(16), 4, 2).fill(7)]) {
+    assert.equal(encode(v).toString('hex'), 'c4' + v.byteLength.toString(16).padStart(2, '0') + hex(v), v.constructor.name);
+  }
+  if (typeof Float16Array !== 'function') return; // Node 24+, or Node 22 with --js-float16array
+  const f16 = new Float16Array([1.5, -2, 65504, 0.25]);
+  assert.equal(encode(f16).toString('hex'), 'c408' + hex(f16));
+  const view = new Float16Array(new ArrayBuffer(16), 4, 3);
+  view.set([1, 2, 3]);
+  assert.equal(encode(view).toString('hex'), 'c406' + hex(view));
+  assert.deepStrictEqual(decode(encode({ v: view })), { v: Buffer.from(hex(view), 'hex') });
+  // Decode input and Ext data given as a Float16Array view.
+  const doc = new Uint8Array(4);
+  doc.set(encode({ a: 1 }));
+  assert.deepStrictEqual(decode(new Float16Array(doc.buffer)), { a: 1 });
+  const ext = new Ext(5, []);
+  ext.data = new Float16Array([1.5]);
+  assert.equal(encode(ext).toString('hex'), 'd505003e');
+});
+
+// A failed Node-API call (a getter, toJSON or Proxy trap that throws) used to leave an
+// uninitialized napi_value behind, which crashed the process (linux-arm64 prebuilds, or
+// builds with -ftrivial-auto-var-init=pattern). The JS error must come through unchanged.
+test('a throwing getter, toJSON or Proxy trap fails encode with that error', async () => {
+  const err = new Error('boom');
+  const thrower = () => {
+    throw err;
+  };
+  const withGetter = (o = {}) => Object.defineProperty(o, 'k', { enumerable: true, get: thrower });
+  class Row {
+    constructor() {
+      withGetter(this);
+    }
+  }
+  class Throwing extends Map {
+    [Symbol.iterator]() {
+      throw err;
+    }
+  }
+  const cases = [
+    withGetter(),
+    withGetter({ a: 1, b: 'x' }),
+    { wrap: [withGetter(), 1], z: { a: 1 } },
+    [withGetter({ a: 1 }), withGetter({ a: 2 })], // rows of a would-be table
+    [{ a: 1, k: 1 }, withGetter({ a: 2 })],
+    new Row(),
+    [new Row(), new Row()],
+    { toJSON: thrower },
+    new Throwing([['a', 1]]),
+    new Proxy({ a: 1 }, { get: thrower }),
+    new Proxy({ a: 1 }, { ownKeys: thrower }),
+    new Proxy({ a: 1 }, { getOwnPropertyDescriptor: thrower }),
+  ];
+  for (let round = 0; round < 3; round++) {
+    for (const [i, v] of cases.entries()) {
+      assert.throws(() => encode(v), (e) => e === err, `case ${i}`);
+      await assert.rejects(encodeAsync(v), (e) => e === err, `case ${i} (async)`);
+    }
+  }
+  assert.deepStrictEqual(rt({ ok: true }), { ok: true }); // still usable
+});
+
+// Terminating a worker while its encodeAsync/decodeAsync was on the thread pool used to abort
+// the whole process: a Napi::Error from the completion callback ended in std::terminate.
+test('terminating a worker during encodeAsync and decodeAsync leaves the process running', async () => {
+  const { Worker } = require('node:worker_threads');
+  const code = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    const btoon = require(workerData.lib);
+    const big = { blob: Buffer.alloc(16 << 20, 7) };
+    const payload = btoon.encode(big, { compress: true });
+    for (let i = 0; i < 4; i++) {
+      btoon.decodeAsync(payload).catch(() => {});
+      btoon.encodeAsync(big, { compress: true }).catch(() => {});
+    }
+    parentPort.postMessage('started');`;
+  for (let round = 0; round < 12; round++) {
+    const w = new Worker(code, { eval: true, workerData: { lib: require.resolve('..') } });
+    await new Promise((resolve, reject) => {
+      w.once('message', resolve);
+      w.once('error', reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, round % 4));
+    await w.terminate();
+  }
+  assert.deepStrictEqual(await decodeAsync(encode({ alive: true })), { alive: true });
+});
+
 test('dates and timestamps', () => {
   const d = new Date('2024-01-01T12:30:15.123Z');
   assert.equal(rt(d).getTime(), d.getTime());
@@ -216,7 +308,8 @@ test('MessagePack interoperability', async () => {
 test('ESM entry point', async () => {
   const esm = await import('../index.mjs');
   assert.equal(typeof esm.encode, 'function');
-  assert.equal(esm.default.VERSION, '0.1.0');
+  assert.equal(esm.default.VERSION, require('../package.json').version);
+  assert.equal(btoon.VERSION, require('../package.json').version);
   assert.deepStrictEqual(esm.decode(esm.encode({ ok: 1 })), { ok: 1 });
 });
 

@@ -32,7 +32,12 @@ jobs:
         with:
           node-version: 22
       - run: npm install --ignore-scripts
+      # Locals start out as a fixed pattern rather than leftover stack, so code that uses an
+      # uninitialized napi_value (as a throwing getter once caused) crashes here every time
+      # instead of passing by luck. The prebuilds are built without it.
       - run: npx node-gyp rebuild
+        env:
+          CXXFLAGS: ${{ runner.os != 'Windows' && '-ftrivial-auto-var-init=pattern' || '' }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}

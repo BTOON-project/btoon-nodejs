@@ -1,6 +1,6 @@
 {
   "name": "btoon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "BTOON for Node.js: compact binary serialization — MessagePack plus columnar tables, timestamps, bigints and vectors (native)",
   "main": "index.js",
   "types": "index.d.ts",

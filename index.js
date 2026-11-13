@@ -7,7 +7,7 @@
 // Loads the prebuilt binary for this platform (prebuilds/) or a local build (build/).
 const native = require('node-gyp-build')(__dirname);
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const SPEC_VERSION = native.specVersion;
 
 /** Error thrown for invalid BTOON data or values that can't be encoded. `code` is a spec error code. */
@@ -57,7 +57,16 @@ class Timestamp {
   }
 }
 
-native.setup({ BtoonError, Ext, Timestamp, Map, arrayFrom: Array.from, objectPrototype: Object.prototype });
+native.setup({
+  BtoonError,
+  Ext,
+  Timestamp,
+  Map,
+  arrayFrom: Array.from,
+  objectPrototype: Object.prototype,
+  // The intrinsic getter, for typed array types the native side doesn't know (Float16Array).
+  typedArrayByteLength: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength').get,
+});
 
 const ALGORITHMS = new Set(['zlib', 'lz4', 'zstd', 'brotli', 'snappy', 'auto']);
 
