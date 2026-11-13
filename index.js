@@ -7,8 +7,14 @@
 // Loads the prebuilt binary for this platform (prebuilds/) or a local build (build/).
 const native = require('node-gyp-build')(__dirname);
 
-const VERSION = '0.1.2';
+const VERSION = '0.2.0';
 const SPEC_VERSION = native.specVersion;
+
+// Core's limits (spec §7 and §7.1).
+const DEFAULT_MAX_DEPTH = native.defaultMaxDepth; // 128
+const MAX_DEPTH_LIMIT = native.maxDepthLimit; // 1000
+const DEFAULT_MAX_DECOMPRESSED_SIZE = native.defaultMaxDecompressedSize; // 64 MiB
+const DEFAULT_MAX_VALUES = native.defaultMaxValues; // 2 ** 20
 
 /** Error thrown for invalid BTOON data or values that can't be encoded. `code` is a spec error code. */
 class BtoonError extends Error {
@@ -27,6 +33,8 @@ const MAX_DATE_MS = 8_640_000_000_000_000n;
 /**
  * An extension value BTOON doesn't interpret: `type` in -128..127 plus raw bytes.
  * Throws BtoonError `invalid_argument` for a type out of range (encode checks it again).
+ * The ids BTOON defines (-1…-6, -10) construct, as in @btoon/js, but encoding one throws
+ * `invalid_argument` (spec §5.7): those types are written from their typed values.
  */
 class Ext {
   constructor(type, data) {
@@ -121,8 +129,12 @@ const LONE_SURROGATE = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]|[\uD800-\uDBFF](?!
 const isWellFormed =
   typeof String.prototype.isWellFormed === 'function' ? (s) => s.isWellFormed() : (s) => !LONE_SURROGATE.test(s);
 
+// Only an absent key (undefined) means "no key" (spec §8). null and an empty key are
+// configuration errors, as in @btoon/js: a key read from an unset or empty source must not
+// silently turn signing or verification off.
 function keyBytes(key) {
-  if (key === undefined || key === null) return undefined;
+  if (key === undefined) return undefined;
+  if (key === null) throw new BtoonError('invalid_argument', 'hmacKey is null; leave it undefined for no key');
   let bytes;
   if (typeof key === 'string') {
     // UTF-8 has no form for a lone surrogate. Buffer.from would write U+FFFD instead, so
@@ -136,10 +148,20 @@ function keyBytes(key) {
   return bytes;
 }
 
+// At most MAX_DEPTH_LIMIT (spec §7): a deeper limit would let input, or a deep value, exhaust
+// the native stack.
 function depth(value, name) {
-  if (value === undefined) return 128;
-  if (!Number.isInteger(value) || value < 1) throw new BtoonError('invalid_argument', `${name} must be a positive integer`);
+  if (value === undefined) return DEFAULT_MAX_DEPTH;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_DEPTH_LIMIT) {
+    throw new BtoonError('invalid_argument', `${name} must be an integer in [1, ${MAX_DEPTH_LIMIT}]`);
+  }
   return value;
+}
+
+function limit(value, name, dflt) {
+  const v = value ?? dflt;
+  if (!Number.isSafeInteger(v) || v < 0) throw new BtoonError('invalid_argument', `${name} must be a non-negative integer`);
+  return v;
 }
 
 function encodeOptions(o = {}) {
@@ -163,12 +185,11 @@ function decodeOptions(o = {}) {
     throw new BtoonError('invalid_argument', "timestamps must be 'date' or 'object'");
   }
   if (bigint !== 'auto' && bigint !== 'always') throw new BtoonError('invalid_argument', "bigint must be 'auto' or 'always'");
-  const max = o.maxDecompressedSize ?? 256 * 1024 * 1024;
-  if (!Number.isSafeInteger(max) || max < 0) throw new BtoonError('invalid_argument', 'maxDecompressedSize must be a non-negative integer');
   return {
     strict: o.strict !== false,
     maxDepth: depth(o.maxDepth, 'maxDepth'),
-    maxDecompressedSize: max,
+    maxDecompressedSize: limit(o.maxDecompressedSize, 'maxDecompressedSize', DEFAULT_MAX_DECOMPRESSED_SIZE),
+    maxValues: limit(o.maxValues, 'maxValues', DEFAULT_MAX_VALUES),
     autoDecompress: o.autoDecompress !== false,
     hmacKey: keyBytes(o.hmacKey),
     timestamps,

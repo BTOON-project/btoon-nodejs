@@ -3,7 +3,7 @@
 Native Node.js bindings for **BTOON**, a compact binary serialization format: **MessagePack
 plus a columnar encoding for arrays of uniform objects**, with timestamps, bigints, float
 vectors and optional compression/signing. Built on the C++ reference implementation
-([btoon-core](https://github.com/BTOON-project/btoon-core)), BTOON spec 0.1. The API is the
+([btoon-core](https://github.com/BTOON-project/btoon-core)), BTOON spec 0.2. The API is the
 same as [`@btoon/js`](https://github.com/BTOON-project/btoon-javascript), the pure
 JavaScript implementation.
 
@@ -33,8 +33,9 @@ const bytes = btoon.encode(rows);           // Buffer; tables are stored column 
 btoon.decode(bytes);                        // deep-equals rows
 
 btoon.encode(rows, { compress: true });     // zlib envelope, detected on decode
-const sealed = btoon.encode(rows, { hmacKey: process.env.BTOON_KEY });
-btoon.decode(sealed, { hmacKey: process.env.BTOON_KEY });
+const key = process.env.BTOON_KEY ?? '';     // unset or empty: encode/decode throw, never skip the MAC
+const sealed = btoon.encode(rows, { hmacKey: key });
+btoon.decode(sealed, { hmacKey: key });
 
 await btoon.decodeAsync(bytes);             // parsing runs on the libuv thread pool
 ```
@@ -51,7 +52,7 @@ await btoon.decodeAsync(bytes);             // parsing runs on the libuv thread 
 | `Float32Array`, `Float64Array` | Packed float vectors (little-endian); embeddings take 4 bytes per value |
 | `Date` → `Date` | `Timestamp` keeps nanoseconds and a UTC offset (`timestamps: 'object'`). Instants outside the range of `Date` decode as `Timestamp` |
 | arrays, plain objects, `Map` (string keys), class instances | Like `JSON.stringify`: own enumerable properties, and `toJSON()` is honored. Keys are written in UTF-8 byte order. Proxies of these (Vue and MobX reactive state) encode like their targets |
-| `Ext(type, data)` | Any other extension type |
+| `Ext(type, data)` | Any other extension type. Types -1 to -6 and -10 are BTOON's own, written from the types above: encoding them as an `Ext` throws `invalid_argument` |
 
 Functions and symbols throw `BtoonError` with `code: 'invalid_argument'`. Cycles throw
 `code: 'max_depth'`. A decoded key named `"__proto__"` becomes an ordinary own property and
@@ -61,17 +62,31 @@ never touches the prototype.
 
 ```ts
 encode(value, { compress?, compression?: 'zlib'|'lz4'|'zstd'|'brotli'|'snappy', autoTabular?, maxDepth?, hmacKey? })
-decode(bytes, { strict?, maxDepth?, maxDecompressedSize?, autoDecompress?, hmacKey?, timestamps?: 'date'|'object', bigint?: 'auto'|'always' })
+decode(bytes, { strict?, maxDepth?, maxDecompressedSize?, maxValues?, autoDecompress?, hmacKey?, timestamps?: 'date'|'object', bigint?: 'auto'|'always' })
 compressionAvailable('zstd')   // the prebuilt binaries include zlib only
 ```
+
+`maxDepth` defaults to 128 and can't exceed 1000. Only an absent `hmacKey` (`undefined`)
+means no key: an empty key or `null` throws `invalid_argument` instead of turning signing or
+verification off.
 
 ## Untrusted input
 
 `decode` is safe on hostile bytes:
 - reads are bounds-checked and nesting depth is limited;
-- it never allocates more than the input justifies, and decompression is capped
-  (`maxDecompressedSize`, 256 MiB by default);
-- strict mode (the default) rejects invalid UTF-8, duplicate keys and trailing data.
+- it never allocates more than the input justifies;
+- strict mode (the default) rejects invalid UTF-8, duplicate keys and trailing data. Keys
+  and column names must be valid UTF-8 in non-strict mode too.
+
+Two limits bound the memory a document can claim (spec §7.1):
+- `maxDecompressedSize` (64 MiB by default) caps what a compression envelope expands to,
+  and the column-name bytes a table copies into its rows (rows × total name length);
+- `maxValues` (2^20 = 1,048,576 by default) caps how many values a document decodes to.
+  The top-level value, every array element and object value, and every table row and cell
+  count once. Keys don't count.
+
+Going over either throws `size_limit`. Raise them to decode bigger documents, and keep the
+defaults (or lower them) for untrusted input.
 
 Every failure throws `BtoonError`, and `err.code` is a spec error code: `truncated`,
 `max_depth`, `invalid_utf8`, `size_limit`, `authentication_failed`, and so on.

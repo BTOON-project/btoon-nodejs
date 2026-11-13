@@ -1,6 +1,6 @@
 # btoon-nodejs
 
-Node-API addon (node-addon-api) wrapping btoon-core. npm package `btoon`, BTOON spec 0.1.
+Node-API addon (node-addon-api) wrapping btoon-core. npm package `btoon`, BTOON spec 0.2.
 The API mirrors `@btoon/js` (btoon-javascript), so keep the two in sync.
 
 ## Commands
@@ -37,8 +37,9 @@ npm run examples
 - Safe integers become ints, everything else float64.
 - Class instances follow `JSON.stringify` (`toJSON`, own enumerable props).
 - `"__proto__"` becomes an own property.
-- An empty `hmacKey`, or a string one with a lone surrogate, is `invalid_argument`
-  (UTF-8 would make it U+FFFD, a key collision). `null` still means no key until D25.
+- An empty or `null` `hmacKey`, or a string one with a lone surrogate, is
+  `invalid_argument` (UTF-8 would make a lone surrogate U+FFFD, a key collision). Only
+  `undefined` means no key (spec 0.2 §8, D25).
 - A string with a lone surrogate is `invalid_utf8` (napi would silently write U+FFFD).
 - A Proxy encodes like its target. `napi_get_prototype` reports null for every Proxy, so a
   null prototype is classified in JS (`proxyKind` in index.js: `Array.isArray`,

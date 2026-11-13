@@ -29,7 +29,12 @@ export declare class BtoonError extends Error {
   readonly code: BtoonErrorCode;
 }
 
-/** An extension value BTOON doesn't interpret. */
+/**
+ * An extension value BTOON doesn't interpret. The ids BTOON defines (-1…-6, -10) construct,
+ * but encoding such an `Ext` throws `invalid_argument` (spec §5.7): those types are written
+ * from their typed values (Date/Timestamp, bigint, Float32Array/Float64Array, arrays of
+ * objects). Ids reserved for future versions (-7…-9, -11…-128) are written as given.
+ */
 export declare class Ext {
   /** @throws {BtoonError} `invalid_argument` unless `type` is an integer in [-128, 127]. */
   constructor(type: number, data: Uint8Array | ArrayLike<number>);
@@ -65,21 +70,40 @@ export interface EncodeOptions {
   compression?: Compression;
   /** Columnar encoding for arrays of uniform objects when smaller (default true). */
   autoTabular?: boolean;
-  /** Nesting limit (default 128); cycles fail with code 'max_depth'. */
+  /**
+   * Nesting limit (default 128, at most 1000: a larger value throws 'invalid_argument');
+   * cycles fail with code 'max_depth'.
+   */
   maxDepth?: number;
   /**
-   * Sign with HMAC-SHA256. A string is used as its UTF-8 bytes. An empty key, or a string
-   * with a lone surrogate, throws 'invalid_argument'.
+   * Sign with HMAC-SHA256. A string is used as its UTF-8 bytes. An empty key, `null`, or a
+   * string with a lone surrogate throws 'invalid_argument'. Leave it undefined for no
+   * signature.
    */
   hmacKey?: Uint8Array | string;
 }
 
 export interface DecodeOptions {
-  /** Reject trailing bytes, invalid UTF-8 and duplicate keys (default true). */
+  /**
+   * Reject trailing bytes, invalid UTF-8 and duplicate keys (default true). Map keys and
+   * column names must be valid UTF-8 either way.
+   */
   strict?: boolean;
+  /** Nesting limit (default 128, at most 1000: a larger value throws 'invalid_argument'). */
   maxDepth?: number;
-  /** Upper bound for compressed input after decompression (default 256 MiB). */
+  /**
+   * Upper bound for compressed input after decompression, in bytes (default 64 MiB). It also
+   * bounds the column-name bytes a table copies into its rows (rows × the names' UTF-8
+   * bytes). Exceeding it throws 'size_limit'.
+   */
   maxDecompressedSize?: number;
+  /**
+   * Upper bound for the number of values a document decodes to (default 1,048,576 = 2^20);
+   * more throw 'size_limit'. Every value counts once: the top-level value, array elements,
+   * object values (not keys), extension values, and each table row and cell. Values inside a
+   * compression envelope count. Raise it to decode larger documents.
+   */
+  maxValues?: number;
   /** Accept compression envelopes (default true). */
   autoDecompress?: boolean;
   /** Require and verify an HMAC-SHA256 signature. The key's rules are as for encode. */
