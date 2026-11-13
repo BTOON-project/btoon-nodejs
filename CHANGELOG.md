@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed (crashes):**
+  - A getter, `toJSON` or Proxy trap that threw during `encode` could crash the process
+    (segfault on the linux-arm64 prebuild). A failed Node-API call left an uninitialized
+    value behind, which was then used. Every Node-API status is now checked, and the
+    error that was thrown reaches the caller unchanged.
+  - `worker.terminate()` while an `encodeAsync` or `decodeAsync` of that worker was
+    running aborted the whole process (`std::terminate` from the completion callback).
+    The callbacks now give up quietly when the worker is gone, and `decodeAsync` no
+    longer reads the options object after it returns.
+- **Fixed:** `Float16Array` encoded as an empty binary on Node 24+, and as half its bytes
+  on Node 22 with `--js-float16array`. Every typed array except `Float32Array` and
+  `Float64Array` now encodes all of its bytes. The same goes for decode input and `Ext`
+  data given as such a view.
+
 ## 0.1.0 (unreleased)
 
 A rewrite on btoon-core 0.1.0 (BTOON spec 0.1). The API matches `@btoon/js`.
