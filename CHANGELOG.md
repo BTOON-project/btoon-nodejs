@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-11-13)
 
 - **Fixed (crashes):**
   - A getter, `toJSON` or Proxy trap that threw during `encode` could crash the process
@@ -15,8 +15,10 @@
   on Node 22 with `--js-float16array`. Every typed array except `Float32Array` and
   `Float64Array` now encodes all of its bytes. The same goes for decode input and `Ext`
   data given as such a view.
+- **Core:** built on btoon-core 0.1.4 (was 0.1.0). Encoding and decoding are unchanged.
+  Source builds on Android work again: core 0.1.2 removed the `shm_open` dependency.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-07)
 
 A rewrite on btoon-core 0.1.0 (BTOON spec 0.1). The API matches `@btoon/js`.
 

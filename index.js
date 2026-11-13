@@ -7,7 +7,7 @@
 // Loads the prebuilt binary for this platform (prebuilds/) or a local build (build/).
 const native = require('node-gyp-build')(__dirname);
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const SPEC_VERSION = native.specVersion;
 
 /** Error thrown for invalid BTOON data or values that can't be encoded. `code` is a spec error code. */

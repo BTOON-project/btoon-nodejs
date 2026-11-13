@@ -308,7 +308,8 @@ test('MessagePack interoperability', async () => {
 test('ESM entry point', async () => {
   const esm = await import('../index.mjs');
   assert.equal(typeof esm.encode, 'function');
-  assert.equal(esm.default.VERSION, '0.1.0');
+  assert.equal(esm.default.VERSION, require('../package.json').version);
+  assert.equal(btoon.VERSION, require('../package.json').version);
   assert.deepStrictEqual(esm.decode(esm.encode({ ok: 1 })), { ok: 1 });
 });
 
