@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      btoon_javascript_ref:
+        description: btoon-javascript ref for the parity job (a branch, tag or commit)
+        type: string
+        default: main
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -43,3 +48,33 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: node --version && npm test
       - run: npm run examples
+
+  # The parity suite side by side with @btoon/js, which is the reference: test/parity.test.js
+  # (and the cross-package checks of test/typed-dates.test.js) with BTOON_JS set, so both
+  # packages must give the same results, error codes and messages, and run user code (getters,
+  # toJSON(), Proxy traps) the same way. A job of its own, so it doesn't hold up the test
+  # matrix. Run the workflow by hand to compare with another btoon-javascript ref.
+  parity:
+    name: parity with @btoon/js (${{ inputs.btoon_javascript_ref || 'main' }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/checkout@v7
+        with:
+          repository: BTOON-project/btoon-javascript
+          ref: ${{ inputs.btoon_javascript_ref || 'main' }}
+          path: btoon-javascript
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Build @btoon/js
+        working-directory: btoon-javascript
+        run: npm ci && npm run build
+      - run: npm install --ignore-scripts
+      - run: npx node-gyp rebuild
+      - name: Side-by-side parity tests
+        run: node --test test/parity.test.js test/typed-dates.test.js
+        env:
+          BTOON_JS: ${{ github.workspace }}/btoon-javascript

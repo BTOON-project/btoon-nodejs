@@ -4,7 +4,8 @@
 // Node-API addon for BTOON. JS values are encoded straight into btoon::Encoder
 // (no intermediate tree); bytes are decoded by btoon-core's hardened decoder
 // into a btoon::Value and then converted to JS. The JS-facing classes
-// (BtoonError, Ext, Timestamp) are defined in index.js and passed to setup().
+// (BtoonError, Ext, Timestamp, BtoonDate, BtoonDateTime) and the helpers that
+// classify JS values are defined in index.js and passed to setup().
 
 // While a worker thread is being terminated, Node-API can neither call into JS nor throw.
 // AsyncWorker callbacks that finish then (OnOK/OnError) fail, and without this node-addon-api
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "btoon/btoon.h"
@@ -39,7 +41,10 @@ using namespace btoon;
 namespace {
 
 struct AddonData {
-    Napi::FunctionReference BtoonError, Ext, Timestamp, MapCtor, ArrayFrom, ProxyKind, TypedArrayByteLength;
+    // The classes of index.js.
+    Napi::FunctionReference BtoonError, Ext, Timestamp, BtoonDate, BtoonDateTime;
+    // index.js's helpers for the encoder: classify, unbox, mapKeys, mapGet, bytesOf.
+    Napi::FunctionReference Classify, Unbox, MapKeys, MapGet, BytesOf, TypedArrayByteLength;
     Napi::ObjectReference ObjectPrototype;
 };
 
@@ -128,31 +133,74 @@ std::span<const uint8_t> arraybuffer_bytes(Napi::Env env, napi_value ab) {
     return {static_cast<const uint8_t*>(data), n};
 }
 
+// A Uint8Array (a Buffer is one) of any realm, by its internal type.
+bool is_uint8_array(Napi::Env env, napi_value v) {
+    bool is_typed = false;
+    check(env, napi_is_typedarray(env, v, &is_typed));
+    if (!is_typed) return false;
+    napi_typedarray_type type = kOtherTypedArray;
+    size_t length = 0;
+    check(env, napi_get_typedarray_info(env, v, &type, &length, nullptr, nullptr, nullptr));
+    return type == napi_uint8_array;
+}
+
 // --- JS -> bytes ------------------------------------------------------------------------
+//
+// A port of @btoon/js's encoder (encode.ts), the reference for both packages: the same
+// classification of values, the same reads of user code (getters, toJSON(), Proxy traps) in
+// the same order, and the same errors. The kinds are its K_* numbers, which index.js's
+// classify() returns too.
 
-struct Entry {
-    std::string key;     // UTF-8
-    Napi::Value value;
+enum Kind : int32_t {
+    K_NONE = 0,  // not an object
+    K_ARRAY = 1,
+    K_PLAIN = 2,  // prototype Object.prototype or null, without an own toJSON()
+    K_VIEW = 3,
+    K_BUFFER = 4,
+    K_DATE = 5,
+    K_MAP = 6,  // a Map of any realm: read with the intrinsic Map methods
+    K_TIMESTAMP = 7,
+    K_EXT = 8,
+    K_TOJSON = 9,  // a class's toJSON(), or a plain object's own
+    K_BOXED = 10,
+    K_OBJECT = 11,  // any other object: its own enumerable string-keyed properties
+    K_BTOON_DATE = 12,
+    K_BTOON_DATETIME = 13,
+    K_PROXY_MAP = 14,  // a Proxy of a Map: read through its own keys() and get()
 };
-using Entries = std::vector<Entry>;
 
-// How an object encodes. The values 0-3 are what proxyKind() in index.js returns.
-enum class Kind : int32_t {
-    Plain = 0,       // prototype Object.prototype or null: own enumerable properties, own toJSON()
-    ProxyArray = 1,  // a Proxy of an array: length and elements are read through the proxy
-    Other = 2,       // binary, Date, Ext, Timestamp, Map, toJSON() or a class instance
-    ProxyDate = 3,   // a Proxy of a Date, which has no time value of its own
-    Array = 4,       // a JS array
+// A map key: its UTF-8 bytes, to sort and write, and the JS string, to read the value with.
+struct Key {
+    std::string utf8;
+    napi_value js;
 };
+using Keys = std::vector<Key>;
+
+// What to encode instead of a raw Ext with an id BTOON defines (spec §5.7), as in @btoon/js.
+const char* typed_instead(int type) {
+    switch (type) {
+        case -1: return "encode a Date or Timestamp";
+        case -2: return "encode a BtoonDate";
+        case -3: return "encode a BtoonDateTime";
+        case -4: return "encode a bigint";
+        case -5: return "encode a Float32Array";
+        case -6: return "encode a Float64Array";
+        case -10: return "encode an array of objects, which uses the tabular encoding where it is smaller";
+        default: return nullptr;
+    }
+}
 
 class JsEncoder {
 public:
     JsEncoder(Napi::Env env, Encoder& enc, size_t max_depth, bool tabular)
         : env_(env), enc_(enc), max_depth_(max_depth), tabular_(tabular), d_(data_of(env)) {}
 
-    // Nested values recurse through encode(), encode_object(), encode_array() and
-    // encode_map_like()/encode_entries(): keep their frames small.
-    void encode(Napi::Value v, size_t depth) {
+    void encode(Napi::Value v) { any(v, 0, true); }
+
+private:
+    // Nested values recurse through any(), object() and array(), plain_map(), map_object() or
+    // try_tabular(): keep their frames small.
+    void any(Napi::Value v, size_t depth, bool allow_to_json) {
         switch (v.Type()) {
             case napi_undefined:
             case napi_null: return enc_.encodeNil();
@@ -160,60 +208,116 @@ public:
             case napi_number: return encode_number(v.As<Napi::Number>().DoubleValue());
             case napi_bigint: return encode_bigint(v.As<Napi::BigInt>());
             case napi_string: return encode_string(v);
-            case napi_object: return encode_object(v.As<Napi::Object>(), depth);
+            case napi_object: {
+                Napi::Object o = v.As<Napi::Object>();
+                return object(o, kind_of(o), depth, allow_to_json);
+            }
             default: unsupported(v.Type());
         }
     }
 
-private:
-    [[noreturn]] BTOON_NOINLINE void unsupported(napi_valuetype t) {
-        const char* name = t == napi_function ? "function" : t == napi_symbol ? "symbol" : t == napi_external ? "external" : "unknown";
-        throw_btoon(env_, "invalid_argument", std::string("cannot encode a value of type ") + name);
+    void object(Napi::Object o, Kind kind, size_t depth, bool allow_to_json) {
+        switch (kind) {
+            case K_ARRAY: return array(o, depth);
+            case K_VIEW: return encode_view(o);
+            case K_BUFFER: return encode_buffer(o);
+            case K_DATE: return encode_date(o);
+            case K_MAP:
+            case K_PROXY_MAP: return map_object(o, kind, depth);
+            case K_TIMESTAMP: return encode_timestamp(o);
+            case K_BTOON_DATE: return encode_epoch(o, false);
+            case K_BTOON_DATETIME: return encode_epoch(o, true);
+            case K_EXT: return encode_ext(o);
+            case K_TOJSON:
+                // Like JSON.stringify, toJSON() is called once per value: a result that has its
+                // own toJSON() is encoded by its own enumerable properties. It adds no depth.
+                if (allow_to_json) return any(call_to_json(o), depth, false);
+                return plain_map(o, depth);
+            case K_BOXED: return any(unbox(o), depth, allow_to_json);
+            default: return plain_map(o, depth);  // K_PLAIN, K_OBJECT
+        }
     }
 
-    BTOON_NOINLINE void encode_string(Napi::Value s) { enc_.encodeString(utf8(s)); }
+    [[noreturn]] BTOON_NOINLINE void unsupported(napi_valuetype t) {
+        const char* name = t == napi_function ? "function" : t == napi_symbol ? "symbol" : "value of this type";
+        throw_btoon(env_, "invalid_argument", std::string("cannot encode a ") + name);
+    }
+
+    [[noreturn]] BTOON_NOINLINE void max_depth_exceeded() {
+        throw_btoon(env_, "max_depth", "maximum nesting depth exceeded (or the value is cyclic)");
+    }
 
     void check_depth(size_t depth) {
-        if (depth >= max_depth_) throw_btoon(env_, "max_depth", "maximum nesting depth exceeded (or the value contains a cycle)");
+        if (depth >= max_depth_) max_depth_exceeded();
     }
 
-    // One call in the common case: a truncated copy leaves at most 3 bytes (a split UTF-8
-    // sequence) plus the terminator unused, so more free space than that proves completeness.
-    std::string_view utf8(Napi::Value s) {
-        if (scratch_.size() < 4096) scratch_.resize(4096);
-        size_t len = 0;
-        check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), scratch_.size(), &len));
-        if (len + 5 > scratch_.size()) {
-            check(env_, napi_get_value_string_utf8(env_, s, nullptr, 0, &len));
-            scratch_.resize(len + 1);
-            check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), len + 1, &len));
+    // --- classification ------------------------------------------------------------------
+
+    // Arrays, plain objects, typed arrays, ArrayBuffers and Dates are settled here without a
+    // call into JS. Every other object goes to index.js's classify(), which is @btoon/js's
+    // classification. napi_get_prototype never runs a Proxy's getPrototypeOf trap and reports
+    // null for every Proxy, so a null prototype (Object.create(null), or a Proxy: Vue and MobX
+    // reactive state) is classified in JS too, where Array.isArray and Object.getPrototypeOf
+    // see through proxies.
+    BTOON_NOINLINE Kind kind_of(Napi::Object o) {
+        bool yes = false;
+        check(env_, napi_is_array(env_, o, &yes));
+        if (yes) return K_ARRAY;
+        napi_value proto;
+        check(env_, napi_get_prototype(env_, o, &proto));
+        check(env_, napi_strict_equals(env_, proto, d_->ObjectPrototype.Value(), &yes));
+        if (yes) return own_to_json(o) ? K_TOJSON : K_PLAIN;
+        napi_valuetype t;
+        check(env_, napi_typeof(env_, proto, &t));
+        if (t != napi_null) {
+            check(env_, napi_is_typedarray(env_, o, &yes));
+            if (!yes) check(env_, napi_is_dataview(env_, o, &yes));
+            if (yes) return K_VIEW;
+            check(env_, napi_is_arraybuffer(env_, o, &yes));
+            if (yes) return K_BUFFER;
+            check(env_, napi_is_date(env_, o, &yes));
+            if (yes) return K_DATE;
         }
-        std::string_view out{scratch_.data(), len};
-        check_well_formed(s, out);
-        return out;
+        napi_value arg = o, kind;
+        check(env_, napi_call_function(env_, env_.Undefined(), d_->Classify.Value(), 1, &arg, &kind));  // traps can throw
+        int32_t k = 0;
+        check(env_, napi_get_value_int32(env_, kind, &k));
+        return k >= K_ARRAY && k <= K_PROXY_MAP ? static_cast<Kind>(k) : K_OBJECT;
     }
 
-    // A lone surrogate has no UTF-8 form, and napi_get_value_string_utf8 silently turns it
-    // into U+FFFD. Like @btoon/js, reject it instead. Only strings whose UTF-8 contains
-    // U+FFFD (EF BF BD) need the UTF-16 check, so the common path stays one scan.
-    void check_well_formed(Napi::Value s, std::string_view u8) {
-        if (u8.find("\xEF\xBF\xBD") == std::string_view::npos) return;
-        size_t n = 0;
-        check(env_, napi_get_value_string_utf16(env_, s, nullptr, 0, &n));
-        std::u16string u16(n + 1, u'\0');
-        check(env_, napi_get_value_string_utf16(env_, s, u16.data(), n + 1, &n));
-        for (size_t i = 0; i < n; ++i) {
-            const char16_t c = u16[i];
-            if (c < 0xD800 || c > 0xDFFF) continue;
-            if (c <= 0xDBFF && i + 1 < n && u16[i + 1] >= 0xDC00 && u16[i + 1] <= 0xDFFF) {
-                ++i;
-                continue;
-            }
-            throw_btoon(env_, "invalid_utf8", "string contains a lone surrogate (use String.prototype.toWellFormed())");
-        }
+    Kind kind_of_value(Napi::Value v) { return v.IsObject() ? kind_of(v.As<Napi::Object>()) : K_NONE; }
+
+    napi_value to_json_key() {
+        if (to_json_key_ == nullptr) to_json_key_ = Napi::String::New(env_, "toJSON");
+        return to_json_key_;
     }
 
-    std::string utf8_copy(Napi::Value s) { return std::string(utf8(s)); }
+    // A plain object's own toJSON(), which JSON.stringify calls. An inherited one, such as a
+    // polluted Object.prototype.toJSON, is ignored.
+    bool own_to_json(Napi::Object o) {
+        bool own = false;
+        check(env_, napi_has_own_property(env_, o, to_json_key(), &own));
+        if (!own) return false;
+        napi_value fn;
+        check(env_, napi_get_property(env_, o, to_json_key(), &fn));
+        napi_valuetype t;
+        check(env_, napi_typeof(env_, fn, &t));
+        return t == napi_function;
+    }
+
+    BTOON_NOINLINE Napi::Value call_to_json(Napi::Object o) {
+        napi_value fn, result;
+        check(env_, napi_get_property(env_, o, to_json_key(), &fn));
+        napi_valuetype t;
+        check(env_, napi_typeof(env_, fn, &t));
+        if (t != napi_function) throw Napi::TypeError::New(env_, "toJSON is not a function");
+        check(env_, napi_call_function(env_, o, fn, 0, nullptr, &result));
+        return Napi::Value(env_, result);
+    }
+
+    BTOON_NOINLINE Napi::Value unbox(Napi::Object o) { return d_->Unbox.Call({o}); }
+
+    // --- scalars ---------------------------------------------------------------------------
 
     void encode_number(double d) {
         // Safe integers are integers; everything else (including -0) is float64.
@@ -248,146 +352,62 @@ private:
         enc_.encodeBigInt(mag);  // normalizes to minimal length
     }
 
-    bool instance_of(Napi::Object o, Napi::FunctionReference& ctor) {
-        bool result = false;
-        check(env_, napi_instanceof(env_, o, ctor.Value(), &result));  // a Proxy's getPrototypeOf trap can throw
-        return result;
-    }
+    BTOON_NOINLINE void encode_string(Napi::Value s) { enc_.encodeString(utf8(s)); }
 
-    // Arrays and plain objects ({} literals) take at most three Node-API calls, and no call into
-    // JS. napi_get_prototype never runs a Proxy's getPrototypeOf trap and reports null for every
-    // Proxy, so a null prototype means Object.create(null) or a Proxy (Vue and MobX reactive
-    // state). Only then does JS classify the object, with Array.isArray and
-    // Object.getPrototypeOf, which see through proxies (as @btoon/js does). Treating every
-    // Proxy as a plain object encoded a proxied [10, 20, 30] as {"0": 10, ...}.
-    BTOON_NOINLINE Kind kind_of(Napi::Object o) {
-        bool is_array = false;
-        check(env_, napi_is_array(env_, o, &is_array));
-        if (is_array) return Kind::Array;
-        napi_value proto;
-        check(env_, napi_get_prototype(env_, o, &proto));
-        bool eq = false;
-        check(env_, napi_strict_equals(env_, proto, d_->ObjectPrototype.Value(), &eq));
-        if (eq) return Kind::Plain;
-        napi_valuetype t;
-        check(env_, napi_typeof(env_, proto, &t));
-        if (t != napi_null) return Kind::Other;
-        napi_value arg = o, kind;
-        check(env_, napi_call_function(env_, env_.Undefined(), d_->ProxyKind.Value(), 1, &arg, &kind));  // traps can throw
-        int32_t k = 0;
-        check(env_, napi_get_value_int32(env_, kind, &k));
-        return k >= 0 && k <= 3 ? static_cast<Kind>(k) : Kind::Other;
-    }
-
-    // Binary, Date, Ext and Timestamp objects have an encoding of their own. (A Proxy of a
-    // typed array or a Date has none of their internal slots, so it never counts.)
-    bool has_own_encoding(Napi::Object o) {
-        return o.IsTypedArray() || o.IsArrayBuffer() || o.IsDataView() || o.IsDate() || instance_of(o, d_->Ext) ||
-               instance_of(o, d_->Timestamp);
-    }
-
-    // The length of a Proxy of an array, read through the proxy as JS would.
-    BTOON_NOINLINE uint32_t proxy_length(Napi::Object o) {
-        Napi::Value v = o.Get("length");
-        double n = v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : -1;
-        if (!(n >= 0 && n <= 4294967295.0 && n == std::trunc(n))) {
-            throw_btoon(env_, "invalid_argument", "a proxied array's length must be an integer in [0, 2^32-1]");
+    // One call in the common case: a truncated copy leaves at most 3 bytes (a split UTF-8
+    // sequence) plus the terminator unused, so more free space than that proves completeness.
+    std::string_view utf8(Napi::Value s) {
+        if (scratch_.size() < 4096) scratch_.resize(4096);
+        size_t len = 0;
+        check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), scratch_.size(), &len));
+        if (len + 5 > scratch_.size()) {
+            check(env_, napi_get_value_string_utf8(env_, s, nullptr, 0, &len));
+            scratch_.resize(len + 1);
+            check(env_, napi_get_value_string_utf8(env_, s, scratch_.data(), len + 1, &len));
         }
-        return static_cast<uint32_t>(n);
-    }
-
-    // Getters and Proxy traps run here and may throw; their exception is rethrown as is.
-    Entries own_entries(Napi::Object o) {
-        napi_value names;
-        check(env_, napi_get_all_property_names(env_, o, napi_key_own_only,
-                                                static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
-                                                napi_key_numbers_to_strings, &names));
-        uint32_t n = 0;
-        check(env_, napi_get_array_length(env_, names, &n));
-        Entries out;
-        out.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) {
-            napi_value k, val;
-            check(env_, napi_get_element(env_, names, i, &k));
-            check(env_, napi_get_property(env_, o, k, &val));
-            out.push_back({utf8_copy(Napi::Value(env_, k)), Napi::Value(env_, val)});
-        }
-        sort(out);
+        std::string_view out{scratch_.data(), len};
+        check_well_formed(s, out);
         return out;
     }
 
-    // If `v` encodes as a BTOON map, returns its entries sorted by UTF-8 key bytes. If it has
-    // toJSON(), calls it once and returns its result in `*replaced` instead.
-    std::optional<Entries> map_entries(Napi::Value v, Napi::Value* replaced) {
-        if (!v.IsObject()) return std::nullopt;
-        Napi::Object o = v.As<Napi::Object>();
-        const Kind kind = kind_of(o);
-        if (kind == Kind::Plain || (kind == Kind::Other && !has_own_encoding(o))) return object_entries(o, kind, replaced);
-        return std::nullopt;
-    }
-
-    // map_entries() for a plain object, or for an Other that has_own_encoding() ruled out.
-    // Plain objects ({} literals, Object.create(null)) only honor an own toJSON().
-    BTOON_NOINLINE std::optional<Entries> object_entries(Napi::Object o, Kind kind, Napi::Value* replaced) {
-        if (kind == Kind::Plain) {
-            bool has_to_json = false;
-            napi_value key = Napi::String::New(env_, "toJSON");
-            check(env_, napi_has_own_property(env_, o, key, &has_to_json));
-            if (has_to_json) {
-                Napi::Value fn = o.Get(key);
-                if (fn.IsFunction()) {
-                    *replaced = fn.As<Napi::Function>().Call(o, {});
-                    return std::nullopt;
-                }
+    // A lone surrogate has no UTF-8 form, and napi_get_value_string_utf8 silently turns it
+    // into U+FFFD. Like @btoon/js, reject it instead. Only strings whose UTF-8 contains
+    // U+FFFD (EF BF BD) need the UTF-16 check, so the common path stays one scan.
+    void check_well_formed(Napi::Value s, std::string_view u8) {
+        if (u8.find("\xEF\xBF\xBD") == std::string_view::npos) return;
+        size_t n = 0;
+        check(env_, napi_get_value_string_utf16(env_, s, nullptr, 0, &n));
+        std::u16string u16(n + 1, u'\0');
+        check(env_, napi_get_value_string_utf16(env_, s, u16.data(), n + 1, &n));
+        for (size_t i = 0; i < n; ++i) {
+            const char16_t c = u16[i];
+            if (c < 0xD800 || c > 0xDFFF) continue;
+            if (c <= 0xDBFF && i + 1 < n && u16[i + 1] >= 0xDC00 && u16[i + 1] <= 0xDFFF) {
+                ++i;
+                continue;
             }
-            return own_entries(o);
+            throw_btoon(env_, "invalid_utf8", "string contains a lone surrogate and cannot be encoded as UTF-8");
         }
-        // Map (a proxied one too: its entries come from its own iterator, through the proxy).
-        if (instance_of(o, d_->MapCtor)) {
-            Napi::Array pairs = d_->ArrayFrom.Call({o}).As<Napi::Array>();
-            Entries out;
-            out.reserve(pairs.Length());
-            for (uint32_t i = 0; i < pairs.Length(); ++i) {
-                Napi::Array kv = pairs.Get(i).As<Napi::Array>();
-                Napi::Value k = kv.Get(uint32_t(0));
-                if (!k.IsString()) throw_btoon(env_, "invalid_argument", "Map keys must be strings");
-                out.push_back({utf8_copy(k), kv.Get(uint32_t(1))});
-            }
-            sort(out);
-            return out;
-        }
-        Napi::Value to_json = o.Get("toJSON");
-        if (to_json.IsFunction()) {
-            *replaced = to_json.As<Napi::Function>().Call(o, {});
-            return std::nullopt;
-        }
-        return own_entries(o);
     }
 
-    static void sort(Entries& e) {
-        std::sort(e.begin(), e.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
-    }
-
-    void encode_entries(const Entries& entries, size_t depth) {
-        check_depth(depth);
-        enc_.encodeMapHeader(entries.size());
-        for (const Entry& e : entries) {
-            enc_.encodeString(e.key);
-            encode(e.value, depth + 1);
-        }
-    }
+    // --- binary, dates, timestamps, extensions -----------------------------------------------
 
     // Float32Array and Float64Array are vectors; every other view is binary, with its bytes as
     // they are in memory (a Float16Array included).
-    void encode_bytes(Napi::Object o) {
+    BTOON_NOINLINE void encode_view(Napi::Object o) {
         if (o.IsTypedArray()) {
             TypedBytes t = typed_array_bytes(env_, o);
             if (t.type == napi_float32_array) return encode_vector<float>(t.bytes.data(), t.length);
             if (t.type == napi_float64_array) return encode_vector<double>(t.bytes.data(), t.length);
             return enc_.encodeBinary(t.bytes);
         }
-        if (o.IsDataView()) return enc_.encodeBinary(dataview_bytes(env_, o));
-        enc_.encodeBinary(arraybuffer_bytes(env_, o));
+        enc_.encodeBinary(dataview_bytes(env_, o));
+    }
+
+    // An ArrayBuffer, or a SharedArrayBuffer, which Node-API reads through a Uint8Array.
+    BTOON_NOINLINE void encode_buffer(Napi::Object o) {
+        if (o.IsArrayBuffer()) return enc_.encodeBinary(arraybuffer_bytes(env_, o));
+        enc_.encodeBinary(typed_array_bytes(env_, d_->BytesOf.Call({o})).bytes);
     }
 
     template <class T>
@@ -402,142 +422,272 @@ private:
         }
     }
 
-    void encode_object(Napi::Object o, size_t depth) {
-        const Kind kind = kind_of(o);
-        if (kind == Kind::Array || kind == Kind::ProxyArray) {
-            return encode_array(o, kind == Kind::Array ? o.As<Napi::Array>().Length() : proxy_length(o), depth);
-        }
-        if (kind == Kind::ProxyDate) throw_btoon(env_, "invalid_argument", "cannot encode a Proxy of a Date");
-        if (kind == Kind::Other && encode_own_encoding(o)) return;
-        encode_map_like(o, kind, depth);
+    // A Date of any realm. A Proxy of one, or an object that only claims to be one, has no time
+    // value: "expected a Date", as in @btoon/js.
+    BTOON_NOINLINE void encode_date(Napi::Object o) {
+        bool is_date = false;
+        check(env_, napi_is_date(env_, o, &is_date));
+        if (!is_date) throw_btoon(env_, "invalid_argument", "expected a Date");
+        double ms = 0;
+        check(env_, napi_get_date_value(env_, o, &ms));
+        if (!std::isfinite(ms)) throw_btoon(env_, "invalid_argument", "cannot encode an invalid Date");
+        enc_.encodeTimestamp(Timestamp::from_milliseconds(static_cast<int64_t>(ms)));
     }
 
-    // Binary, Date, Ext or Timestamp; false for anything else.
-    BTOON_NOINLINE bool encode_own_encoding(Napi::Object o) {
-        if (o.IsTypedArray() || o.IsArrayBuffer() || o.IsDataView()) {
-            encode_bytes(o);
-        } else if (o.IsDate()) {
-            double ms = o.As<Napi::Date>().ValueOf();
-            if (!std::isfinite(ms)) throw_btoon(env_, "invalid_argument", "cannot encode an invalid Date");
-            enc_.encodeTimestamp(Timestamp::from_milliseconds(static_cast<int64_t>(ms)));
-        } else if (instance_of(o, d_->Ext)) {
-            encode_ext(o);
-        } else if (instance_of(o, d_->Timestamp)) {
-            encode_timestamp(o);
-        } else {
-            return false;
-        }
-        return true;
-    }
-
-    void encode_map_like(Napi::Object o, Kind kind, size_t depth) {
-        Napi::Value replaced;
-        auto entries = object_entries(o, kind, &replaced);
-        if (entries) return encode_entries(*entries, depth);
-        if (replaced.IsEmpty()) throw_btoon(env_, "invalid_argument", "cannot encode this object");
-        check_depth(depth);  // toJSON() chains terminate
-        encode(replaced, depth + 1);
-    }
-
-    // Ext and Timestamp fields are writable, so they're checked here, as @btoon/js does: a value
-    // out of range used to wrap silently (Ext type 300 became 44).
+    // Timestamp, BtoonDate, BtoonDateTime and Ext fields are writable, so they're checked here,
+    // as @btoon/js does: a value out of range used to wrap silently (Ext type 300 became 44).
     static bool is_integer_in(Napi::Value v, double lo, double hi) {
         if (!v.IsNumber()) return false;
         double d = v.As<Napi::Number>().DoubleValue();
         return d >= lo && d <= hi && d == std::trunc(d);
     }
 
-    // Core's encodeExtension() rejects the ids BTOON defines (-1…-6, -10) with invalid_argument
-    // (SPEC §5.7), which encode_bare() turns into a BtoonError: those types are written from
-    // their typed values, never verbatim.
-    void encode_ext(Napi::Object o) {
-        Napi::Value type = o.Get("type");
-        if (!is_integer_in(type, -128, 127)) throw_btoon(env_, "invalid_argument", "Ext type must be an integer in [-128, 127]");
-        Napi::Value data = o.Get("data");
-        if (!data.IsTypedArray()) throw_btoon(env_, "invalid_argument", "Ext data must be a Uint8Array");
-        enc_.encodeExtension(static_cast<int8_t>(type.As<Napi::Number>().Int32Value()), typed_array_bytes(env_, data).bytes);
-    }
-
-    // Seconds beyond int64 used to wrap: 2n**64n encoded as the epoch, 2n**63n as -2^63.
-    void encode_timestamp(Napi::Object o) {
+    BTOON_NOINLINE void encode_timestamp(Napi::Object o) {
         Napi::Value seconds = o.Get("seconds");
+        Napi::Value nanos = o.Get("nanoseconds");
+        Napi::Value off = o.Get("offsetMinutes");
         bool lossless = false;
         int64_t secs = seconds.IsBigInt() ? seconds.As<Napi::BigInt>().Int64Value(&lossless) : 0;
         if (!lossless) throw_btoon(env_, "invalid_argument", "Timestamp seconds must be a bigint in the int64 range");
-        Napi::Value nanos = o.Get("nanoseconds");
         if (!is_integer_in(nanos, 0, 999999999)) {
             throw_btoon(env_, "invalid_argument", "Timestamp nanoseconds must be an integer in [0, 999999999]");
         }
         const auto ns = static_cast<uint32_t>(nanos.As<Napi::Number>().Int64Value());
-        Napi::Value off = o.Get("offsetMinutes");
-        if (off.IsUndefined() || off.IsNull()) return enc_.encodeTimestamp(Timestamp(secs, ns));
+        if (off.IsUndefined()) return enc_.encodeTimestamp(Timestamp(secs, ns));
         if (!is_integer_in(off, -1080, 1080)) {
             throw_btoon(env_, "invalid_argument", "Timestamp offsetMinutes must be an integer in [-1080, 1080]");
         }
         enc_.encodeTimestamp(Timestamp(secs, ns, static_cast<int16_t>(off.As<Napi::Number>().Int32Value())));
     }
 
-    // `arr` is an array, or a Proxy of one (elements are read through the proxy). A plain array
-    // reuses the map entries try_tabular() computed, so getters and toJSON() run once.
-    void encode_array(Napi::Object arr, uint32_t n, size_t depth) {
+    // A BtoonDate (date, -2) or BtoonDateTime (datetime, -3): fixext 8 holding the i64 epoch value.
+    BTOON_NOINLINE void encode_epoch(Napi::Object o, bool datetime) {
+        Napi::Value v = o.Get(datetime ? "epochNanoseconds" : "epochMilliseconds");
+        bool lossless = false;
+        int64_t epoch = v.IsBigInt() ? v.As<Napi::BigInt>().Int64Value(&lossless) : 0;
+        if (!lossless) {
+            throw_btoon(env_, "invalid_argument",
+                        datetime ? "BtoonDateTime epochNanoseconds must be a bigint in the int64 range"
+                                 : "BtoonDate epochMilliseconds must be a bigint in the int64 range");
+        }
+        if (datetime) return enc_.encodeDateTime(epoch);
+        enc_.encodeDate(epoch);
+    }
+
+    // The ids BTOON defines (-1…-6, -10) are refused (spec §5.7): those types are written from
+    // their typed values, never verbatim. Ids reserved for future versions are written as given.
+    BTOON_NOINLINE void encode_ext(Napi::Object o) {
+        Napi::Value type = o.Get("type");
+        Napi::Value data = o.Get("data");
+        if (!is_integer_in(type, -128, 127)) throw_btoon(env_, "invalid_argument", "Ext type must be an integer in [-128, 127]");
+        const int t = type.As<Napi::Number>().Int32Value();
+        if (const char* instead = typed_instead(t)) {
+            throw_btoon(env_, "invalid_argument",
+                        "Ext type " + std::to_string(t) + " is defined by BTOON and can't be written raw (SPEC \xC2\xA7" "5.7); " + instead);
+        }
+        if (!is_uint8_array(env_, data)) throw_btoon(env_, "invalid_argument", "Ext data must be a Uint8Array");
+        enc_.encodeExtension(static_cast<int8_t>(t), typed_array_bytes(env_, data).bytes);
+    }
+
+    // --- maps ------------------------------------------------------------------------------
+
+    static void sort(Keys& keys) {
+        std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.utf8 < b.utf8; });
+    }
+
+    // Object.keys(o): own enumerable string keys. Getters and Proxy traps run later, as each
+    // value is read.
+    BTOON_NOINLINE Keys own_keys(Napi::Object o) {
+        napi_value names;
+        check(env_, napi_get_all_property_names(env_, o, napi_key_own_only,
+                                                static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                                                napi_key_numbers_to_strings, &names));
+        uint32_t n = 0;
+        check(env_, napi_get_array_length(env_, names, &n));
+        Keys keys;
+        keys.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value k;
+            check(env_, napi_get_element(env_, names, i, &k));
+            keys.push_back({std::string(utf8(Napi::Value(env_, k))), k});
+        }
+        return keys;
+    }
+
+    // A Map's keys, from index.js's mapKeys(): nullopt if one isn't a string.
+    BTOON_NOINLINE std::optional<Keys> map_keys(Napi::Object m, Kind kind) {
+        Napi::Value list = d_->MapKeys.Call({m, Napi::Number::New(env_, kind)});
+        if (!list.IsArray()) return std::nullopt;
+        Napi::Array a = list.As<Napi::Array>();
+        const uint32_t n = a.Length();
+        Keys keys;
+        keys.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value k;
+            check(env_, napi_get_element(env_, a, i, &k));
+            keys.push_back({std::string(utf8(Napi::Value(env_, k))), k});
+        }
+        return keys;
+    }
+
+    // The keys of a value that encodes as a map, or nullopt.
+    std::optional<Keys> row_keys(Napi::Value v, Kind kind) {
+        if (kind == K_PLAIN || kind == K_OBJECT) return own_keys(v.As<Napi::Object>());
+        if (kind == K_MAP || kind == K_PROXY_MAP) return map_keys(v.As<Napi::Object>(), kind);
+        return std::nullopt;
+    }
+
+    // The value of a map-like value at `key`; `kind` is its kind.
+    Napi::Value entry(napi_value m, Kind kind, napi_value key) {
+        if (kind == K_MAP || kind == K_PROXY_MAP) {
+            return d_->MapGet.Call({Napi::Value(env_, m), Napi::Number::New(env_, kind), Napi::Value(env_, key)});
+        }
+        napi_value v;
+        check(env_, napi_get_property(env_, m, key, &v));  // getters and Proxy traps run here
+        return Napi::Value(env_, v);
+    }
+
+    void plain_map(Napi::Object o, size_t depth) {
         check_depth(depth);
-        std::vector<Napi::Value> items;
-        items.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) items.push_back(arr.Get(i));
-        std::vector<Entries> rows;
-        if (tabular_ && n >= 2 && try_tabular(items, rows, depth)) return;
+        Keys keys = own_keys(o);
+        sort(keys);
+        enc_.encodeMapHeader(keys.size());
+        for (const Key& k : keys) {
+            enc_.encodeString(k.utf8);
+            any(entry(o, K_PLAIN, k.js), depth + 1, true);
+        }
+    }
+
+    void map_object(Napi::Object m, Kind kind, size_t depth) {
+        check_depth(depth);
+        std::optional<Keys> keys = map_keys(m, kind);
+        if (!keys) throw_btoon(env_, "invalid_argument", "Map keys must be strings");
+        sort(*keys);
+        enc_.encodeMapHeader(keys->size());
+        for (const Key& k : *keys) {
+            enc_.encodeString(k.utf8);
+            any(entry(m, kind, k.js), depth + 1, true);
+        }
+    }
+
+    // --- arrays and tables -------------------------------------------------------------------
+
+    napi_value element(Napi::Object arr, uint32_t i) {
+        napi_value v;
+        check(env_, napi_get_element(env_, arr, i, &v));
+        return v;
+    }
+
+    // The length of an array, or of a Proxy of one (read through the proxy, as JS would).
+    BTOON_NOINLINE uint32_t array_length(Napi::Object arr) {
+        bool is_array = false;
+        check(env_, napi_is_array(env_, arr, &is_array));
+        uint32_t n = 0;
+        if (is_array) {
+            check(env_, napi_get_array_length(env_, arr, &n));
+            return n;
+        }
+        Napi::Value v = arr.Get("length");
+        double d = v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : -1;
+        if (!(d >= 0 && d <= 4294967295.0 && d == std::trunc(d))) {
+            throw_btoon(env_, "invalid_argument", "an array length must be an integer in [0, 2^32-1]");
+        }
+        return static_cast<uint32_t>(d);
+    }
+
+    void array(Napi::Object arr, size_t depth) {
+        check_depth(depth);
+        const uint32_t n = array_length(arr);
+        std::vector<napi_value> items;  // what try_tabular() resolved, when it declines
+        uint32_t resolved_up_to = 0;
+        if (tabular_ && n >= 2 && try_tabular(arr, n, depth, items, resolved_up_to)) return;
         enc_.encodeArrayHeader(n);
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (i < rows.size()) {
-                encode_entries(rows[i], depth + 1);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (i < resolved_up_to) {
+                any(Napi::Value(env_, items[i]), depth + 1, false);
             } else {
-                encode(items[i], depth + 1);
+                any(Napi::Value(env_, element(arr, i)), depth + 1, true);
             }
         }
     }
 
-    // SPEC §5.6.2: ≥ 2 rows, all maps (plain objects, class instances, Maps), same non-empty key set,
-    // and the size rule. Writes the table and returns true; otherwise returns false with the
-    // entries of the rows it got through in `rows` (and toJSON() results in `items`).
-    BTOON_NOINLINE bool try_tabular(std::vector<Napi::Value>& items, std::vector<Entries>& rows, size_t depth) {
-        rows.reserve(items.size());
-        for (size_t r = 0; r < items.size(); ++r) {
-            Napi::Value replaced;
-            auto entries = map_entries(items[r], &replaced);
-            if (!replaced.IsEmpty()) {
-                // toJSON() ran once; its result is what gets encoded (and may itself be a map).
-                items[r] = replaced;
-                Napi::Value again;
-                entries = map_entries(replaced, &again);
-                if (!again.IsEmpty()) {
-                    items[r] = again;
-                    return false;
-                }
+    // The same key set as the first row's: in the same order, or else as sets (keys are unique).
+    static bool same_keys(const Keys& keys, const Keys& first, std::unordered_set<std::string>& first_set) {
+        if (keys.size() != first.size()) return false;
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (keys[k].utf8 == first[k].utf8) continue;
+            if (first_set.empty()) {
+                for (const Key& f : first) first_set.insert(f.utf8);
             }
-            if (!entries || entries->empty()) return false;
-            if (r > 0) {
-                const Entries& first = rows[0];
-                bool same = entries->size() == first.size();
-                for (size_t k = 0; same && k < first.size(); ++k) same = (*entries)[k].key == first[k].key;
-                if (!same) {
-                    rows.push_back(std::move(*entries));
-                    return false;
-                }
+            for (const Key& key : keys) {
+                if (first_set.count(key.utf8) == 0) return false;
             }
-            rows.push_back(std::move(*entries));
+            return true;
         }
+        return true;
+    }
+
+    // SPEC §5.6.2, as @btoon/js's planTabular(): ≥ 2 elements that encode as maps (plain
+    // objects, class instances, Maps, toJSON() results) with the same non-empty key set, and
+    // the size rule. Elements with toJSON() are resolved here, once. The table is written from
+    // the rows as planned, so code that runs while it is written (getters, toJSON()) can't swap
+    // or remove a row. When it declines, items[0..resolved_up_to) holds the elements already
+    // resolved, so the plain path doesn't call toJSON() twice.
+    BTOON_NOINLINE bool try_tabular(Napi::Object arr, uint32_t n, size_t depth, std::vector<napi_value>& items,
+                                    uint32_t& resolved_up_to) {
+        std::vector<napi_value> rows;  // both allocated once the first element qualifies (or has toJSON())
+        std::vector<Kind> kinds;
+        bool resolved_any = false;
+        Keys first;
+        std::unordered_set<std::string> first_set;
+        auto decline = [&](uint32_t up_to) {
+            if (resolved_any) {
+                items = std::move(rows);
+                resolved_up_to = up_to;
+            }
+            return false;
+        };
+        for (uint32_t i = 0; i < n; ++i) {
+            Napi::Value row(env_, element(arr, i));
+            Kind kind = kind_of_value(row);
+            if (kind == K_TOJSON) {
+                row = call_to_json(row.As<Napi::Object>());
+                kind = kind_of_value(row);
+                if (kind == K_TOJSON) kind = K_OBJECT;  // no second toJSON()
+                resolved_any = true;
+            }
+            std::optional<Keys> keys = row_keys(row, kind);
+            bool ok = keys.has_value();
+            if (ok) {
+                if (i == 0) {
+                    first = std::move(*keys);
+                    ok = !first.empty();
+                } else {
+                    ok = same_keys(*keys, first, first_set);
+                }
+            }
+            if (ok || resolved_any) {
+                if (rows.empty()) rows.resize(n);  // every earlier element qualified, so this is the first
+                rows[i] = row;
+            }
+            if (!ok) return decline(i + 1);
+            if (kinds.empty()) kinds.resize(n);
+            kinds[i] = kind;
+        }
+        sort(first);
         std::vector<size_t> lengths;
         std::vector<std::string_view> names;
-        for (const Entry& e : rows[0]) {
-            lengths.push_back(e.key.size());
-            names.push_back(e.key);
+        for (const Key& k : first) {
+            lengths.push_back(k.utf8.size());
+            names.push_back(k.utf8);
         }
-        if (!btoon::tabular_beneficial(rows.size(), lengths)) return false;
-        if (depth + 1 >= max_depth_) throw_btoon(env_, "max_depth", "maximum nesting depth exceeded (or the value contains a cycle)");
-        enc_.beginTabular(names, rows.size());
-        for (size_t c = 0; c < names.size(); ++c) {
+        if (!btoon::tabular_beneficial(n, lengths)) return decline(n);
+        if (depth + 1 >= max_depth_) max_depth_exceeded();
+        // Core reads each column's type code off the encoding of its first cell (spec §5.6.1).
+        enc_.beginTabular(names, n);
+        for (const Key& k : first) {
             enc_.beginTabularColumn();
-            for (const Entries& row : rows) encode(row[c].value, depth + 2);
+            for (uint32_t r = 0; r < n; ++r) any(entry(rows[r], kinds[r], k.js), depth + 2, true);
             enc_.endTabularColumn();
         }
         enc_.endTabular();
@@ -550,6 +700,7 @@ private:
     bool tabular_;
     AddonData* d_;
     std::string scratch_;
+    napi_value to_json_key_ = nullptr;
 };
 
 // --- bytes -> JS ----------------------------------------------------------------------------
@@ -562,10 +713,12 @@ struct DecodeCtx {
     std::unordered_map<std::string_view, Napi::Value> keys;  // repeated keys share one JS string
 };
 
+// An integer's JavaScript type depends on its value, never on how it was encoded (spec §7), as
+// in @btoon/js. bigint: 'auto' gives a number for a safe integer; 'always' gives one only in
+// [-2^31, 2^32-1], what a canonical encoder writes without a 64-bit marker or a bigint extension.
 Napi::Value int_to_js(DecodeCtx& c, int64_t v) {
-    if (!c.bigint_always && v >= -9007199254740991LL && v <= 9007199254740991LL) {
-        return Napi::Number::New(c.env, static_cast<double>(v));
-    }
+    const bool number = c.bigint_always ? v >= -2147483648LL && v <= 4294967295LL : v >= -9007199254740991LL && v <= 9007199254740991LL;
+    if (number) return Napi::Number::New(c.env, static_cast<double>(v));
     return Napi::BigInt::New(c.env, v);
 }
 
@@ -677,16 +830,18 @@ Napi::Value to_js(DecodeCtx& c, const Value& v) {
             return instant_to_js(c, ts.seconds, ts.nanoseconds, off);
         }
         case 11: {
-            int64_t ms = std::get<Date>(v).milliseconds;
-            int64_t s = ms / 1000, r = ms % 1000;
-            if (r < 0) { r += 1000; --s; }
-            return instant_to_js(c, s, static_cast<uint32_t>(r * 1000000), std::nullopt);
+            // A BtoonDate keeps the type (spec §10). With timestamps: 'date', a Date if it fits.
+            const int64_t ms = std::get<Date>(v).milliseconds;
+            if (!c.timestamps_as_objects && ms >= -kMaxDateMs && ms <= kMaxDateMs) return Napi::Date::New(c.env, static_cast<double>(ms));
+            return c.d->BtoonDate.New({Napi::BigInt::New(c.env, ms)});
         }
         case 12: {
-            int64_t ns = std::get<DateTime>(v).nanoseconds;
-            int64_t s = ns / 1000000000, r = ns % 1000000000;
-            if (r < 0) { r += 1000000000; --s; }
-            return instant_to_js(c, s, static_cast<uint32_t>(r), std::nullopt);
+            // Every datetime (±2^63 ns, about ±292 years) is within the range of Date.
+            const int64_t ns = std::get<DateTime>(v).nanoseconds;
+            if (c.timestamps_as_objects) return c.d->BtoonDateTime.New({Napi::BigInt::New(c.env, ns)});
+            int64_t ms = ns / 1000000;
+            if (ns % 1000000 < 0) --ms;  // floor
+            return Napi::Date::New(c.env, static_cast<double>(ms));
         }
         case 13: return bigint_to_js(c, std::get<BigInt>(v).bytes);
         case 14: return vector_to_js(c, std::get<VectorFloat>(v).data);
@@ -703,7 +858,6 @@ CompressionAlgorithm parse_algorithm(Napi::Env env, const std::string& name) {
     if (name == "zstd") return CompressionAlgorithm::ZSTD;
     if (name == "brotli") return CompressionAlgorithm::BROTLI;
     if (name == "snappy") return CompressionAlgorithm::SNAPPY;
-    if (name == "auto") return CompressionAlgorithm::AUTO;
     throw_btoon(env, "invalid_argument", "unknown compression algorithm: '" + name + "'");
 }
 
@@ -763,7 +917,7 @@ std::vector<uint8_t> encode_bare(Napi::Env env, Napi::Value value, const EncodeO
     Encoder enc(opts);
     JsEncoder walker(env, enc, opts.max_depth, opts.auto_tabular);
     try {
-        walker.encode(value, 0);
+        walker.encode(value);
         return enc.release();
     } catch (const BtoonException& e) {
         throw_btoon(env, e.code_name(), e.what());
@@ -774,7 +928,7 @@ std::span<const uint8_t> input_bytes(Napi::Env env, Napi::Value v) {
     if (v.IsTypedArray()) return typed_array_bytes(env, v).bytes;
     if (v.IsArrayBuffer()) return arraybuffer_bytes(env, v);
     if (v.IsDataView()) return dataview_bytes(env, v);
-    throw_btoon(env, "invalid_argument", "decode expects a Uint8Array, Buffer, ArrayBuffer or DataView");
+    throw_btoon(env, "invalid_argument", "decode() expects a Uint8Array, ArrayBuffer or other ArrayBufferView");
 }
 
 // --- entry points ---------------------------------------------------------------------------
@@ -899,10 +1053,10 @@ private:
 Napi::Value DecodeAsync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Object o = info[1].As<Napi::Object>();
+    DecodeOptions opts = decode_options(env, o);
     std::span<const uint8_t> in = input_bytes(env, info[0]);
     // Copy: the caller may mutate their buffer while we work off-thread.
-    auto* worker = new DecodeWorker(env, std::vector<uint8_t>(in.begin(), in.end()), decode_options(env, o),
-                                    output_options(o));
+    auto* worker = new DecodeWorker(env, std::vector<uint8_t>(in.begin(), in.end()), std::move(opts), output_options(o));
     Napi::Promise p = worker->Promise();
     worker->Queue();
     return p;
@@ -948,15 +1102,20 @@ Napi::Value EncodeAsync(const Napi::CallbackInfo& info) {
 Napi::Value Setup(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Object o = info[0].As<Napi::Object>();
+    auto fn = [&](const char* name) { return Napi::Persistent(o.Get(name).As<Napi::Function>()); };
     auto* d = new AddonData();
-    d->BtoonError = Napi::Persistent(o.Get("BtoonError").As<Napi::Function>());
-    d->Ext = Napi::Persistent(o.Get("Ext").As<Napi::Function>());
-    d->Timestamp = Napi::Persistent(o.Get("Timestamp").As<Napi::Function>());
-    d->MapCtor = Napi::Persistent(o.Get("Map").As<Napi::Function>());
-    d->ArrayFrom = Napi::Persistent(o.Get("arrayFrom").As<Napi::Function>());
-    d->ProxyKind = Napi::Persistent(o.Get("proxyKind").As<Napi::Function>());
+    d->BtoonError = fn("BtoonError");
+    d->Ext = fn("Ext");
+    d->Timestamp = fn("Timestamp");
+    d->BtoonDate = fn("BtoonDate");
+    d->BtoonDateTime = fn("BtoonDateTime");
+    d->Classify = fn("classify");
+    d->Unbox = fn("unbox");
+    d->MapKeys = fn("mapKeys");
+    d->MapGet = fn("mapGet");
+    d->BytesOf = fn("bytesOf");
+    d->TypedArrayByteLength = fn("typedArrayByteLength");
     d->ObjectPrototype = Napi::Persistent(o.Get("objectPrototype").As<Napi::Object>());
-    d->TypedArrayByteLength = Napi::Persistent(o.Get("typedArrayByteLength").As<Napi::Function>());
     env.SetInstanceData(d);  // deleted with the environment (worker threads get their own)
     return env.Undefined();
 }

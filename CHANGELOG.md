@@ -1,5 +1,117 @@
 # Changelog
 
+## 0.3.0 (2026-11-14)
+
+BTOON spec 0.3, on btoon-core 0.3.0: `SPEC_VERSION` is `'0.3'`. The wire format is unchanged.
+Every BTOON type now round-trips, dates and datetimes included, and the API and its behavior
+match `@btoon/js` 0.3.0 exactly, which is the reference: this release ports its option checks,
+constructors and classification of values, and fixes the remaining findings of the 2026-11-13
+review. Each behavior change is marked.
+
+- **New: `BtoonDate` and `BtoonDateTime`**, typed values for the date (-2) and datetime (-3)
+  extensions, which couldn't be written before. Both subclass `Timestamp` and hold the exact
+  value on the wire, `epochMilliseconds` or `epochNanoseconds`, a `bigint` in the int64 range;
+  `seconds` and `nanoseconds` describe the same instant, floored. The constructors take a
+  `bigint` or a safe-integer `number`. `fromDate(date)`, `fromTimestamp(ts)` and `toDate()`
+  convert; a date floors to the millisecond, and a `Timestamp` with a UTC offset or out of
+  range is `invalid_argument`. `encode` writes them as `fixext 8` with a big-endian `i64`,
+  table cells included. A raw `Ext(-2)`/`Ext(-3)` is still refused, now with a message that
+  names these types.
+- **Behavior change:** with `timestamps: 'object'`, a date decodes to a `BtoonDate` and a
+  datetime to a `BtoonDateTime`, not a plain `Timestamp`, so a decoded document encodes back to
+  the same bytes. Code that checks `instanceof Timestamp` or reads `seconds`/`nanoseconds` keeps
+  working. With the default `'date'`, a date outside the range of `Date` decodes to a
+  `BtoonDate` instead of a `Timestamp`.
+- **Fixed (security):** `decode(view, { hmacKey })` of input in a `SharedArrayBuffer` verified
+  the signature over shared memory and then parsed that memory again, which another thread
+  can change in between: in the review, a worker flipping one byte got 223 forgeries through.
+  Input in shared memory is now copied once, then verified and parsed. `decode` also accepts a
+  `SharedArrayBuffer` itself now (it threw `invalid_argument`).
+- **Fixed:** a `Map` subclass whose iterator repeats a key wrote that key twice. Maps are now
+  read with the intrinsic `Map` methods, so a subclass's own iterator, `keys()` or `get()`
+  can't change what is written. A Proxy of a `Map` (Vue's and MobX's reactive Maps) is read
+  through its own `keys()` and `get()`, and one that repeats a key throws `invalid_argument`.
+- **Fixed (parity with `@btoon/js`):** these encoded differently from `@btoon/js` and
+  `JSON.stringify`:
+  - `Number`, `String`, `Boolean` and `BigInt` wrapper objects encoded as `{}` (a `String`
+    as `{"0": …}`). They're unwrapped now.
+  - A `SharedArrayBuffer` encoded as `{}`; it's binary now.
+  - A `Map` from another realm (a `vm` context) encoded as `{}`; it's a map now.
+  - **Behavior change:** `toJSON()` is called once per value, as `JSON.stringify` does: a
+    `toJSON()` result that has `toJSON()` itself is encoded by its own properties. A chain of
+    `toJSON()` calls used to be followed, each adding a nesting level, so a class with
+    `toJSON()` (a Decimal, an ObjectId) 128 arrays deep threw `max_depth`. `toJSON()` adds no
+    nesting level now.
+  - **Behavior change:** `bigint: 'always'` gives a `bigint` for every integer outside
+    [-2^31, 2^32-1], which is what a canonical encoder writes as uint64, int64 or a bigint
+    extension, and a `number` inside it. It used to give a `bigint` for every integer, so
+    `decode(encode(5), { bigint: 'always' })` is now `5`, not `5n`. The type depends on the
+    value, never on the encoding (spec §7), as in `@btoon/js`. `bigint: 'auto'` is unchanged.
+- **Behavior change:** options are checked as in `@btoon/js`, with the same messages:
+  - `compress`, `autoTabular`, `strict` and `autoDecompress` must be booleans (any value
+    counted by its truthiness before);
+  - `maxValues` and `maxDecompressedSize` must be non-negative safe integers; `null` is
+    `invalid_argument` (it meant the default);
+  - `maxDepth` may be 0 (only scalars encode or decode), as in `@btoon/js`;
+  - options that aren't an object throw `invalid_argument`, and `null` options mean the
+    defaults (a `null` threw a `TypeError`);
+  - `codecs` (from `@btoon/js`) is checked the same way, but this package doesn't call
+    caller-supplied codecs;
+  - an `hmacKey` `Uint8Array` from another realm works.
+- **Deprecated:** `compression: 'auto'` is an alias for `'zlib'` now, which is what it wrote
+  (the builds have only zlib) and what spec §6 says encoders use when no algorithm is named.
+  It still works, and emits a `DeprecationWarning` (code `BTOON_DEP_AUTO`) once per process; use
+  `'zlib'` or leave the option out. `compressionAvailable('auto')` answers for zlib, so it's
+  `true` (it was `false`). `@btoon/js` doesn't accept `'auto'`, so code shared with it
+  shouldn't pass it.
+- **Behavior change:** the constructors check their arguments as in `@btoon/js`:
+  - `new Ext(type, data)` needs a `Uint8Array` (a `Buffer` is one). It converted array-likes
+    and other typed arrays element by element, so a `Uint16Array` lost its high bytes. An
+    `Ext` whose `data` was replaced by another typed array is refused on encode too.
+  - `new Timestamp(seconds)` needs a `bigint` or a safe-integer `number`; strings and unsafe
+    numbers went through `BigInt()`. `nanoseconds` still defaults to 0.
+  - `Timestamp.fromDate()` of something that isn't a `Date` throws `invalid_argument`, not a
+    `TypeError`; an invalid `Date` says "cannot convert an invalid Date".
+  - A `Timestamp` whose `offsetMinutes` was set to `null` throws `invalid_argument` on encode;
+    only `undefined` means no offset (`null` did too).
+  - `BtoonError` takes `{ cause }`, as in `@btoon/js`.
+- **Changed:** `instanceof BtoonError`, `Ext`, `Timestamp`, `BtoonDate` and `BtoonDateTime`
+  check brands that `@btoon/js` shares, so values from either package (and any realm) are
+  recognized by both packages' `instanceof` and encoders.
+- **Changed:** user code runs as in `@btoon/js`. An object's own keys are read first, then each
+  value as it is written, in key order (all values were read first, in property order); a
+  table is written column by column from the rows as planned. The encoder's error messages
+  are `@btoon/js`'s ("cannot encode a function", "maximum nesting depth exceeded (or the value
+  is cyclic)", "expected a Date" for a Proxy of a Date, …).
+- **Fixed:** `index.mjs` lacked `version` (and now exports `BtoonDate` and `BtoonDateTime`).
+- **Fixed (types):** `index.d.ts` references the Node.js types it uses (`Buffer`), so it
+  compiles without the consumer's own `types: ["node"]`. It declares `VERSION` and
+  `SPEC_VERSION` as literals, `CompressionAlgorithm` (`Compression` stays as a deprecated
+  alias), `BinaryInput`, `Codec` and `CodecRegistry`, `Ext` data as a `Uint8Array`, and
+  `instanceof` narrowing.
+- **Fixed (build):** `binding.gyp` compiled every btoon-core source, so a core module the addon
+  doesn't use could break a source build: on Android, an older core's `shm_open` did. It now
+  compiles only the seven sources the addon needs (`scripts/core-path.js`), and the package
+  ships only those.
+- **Docs:** the README explains source builds under npm 12, which runs a dependency's install
+  script only after `npm install-scripts approve btoon` (then `npm rebuild btoon`; globally,
+  `npm install -g btoon --allow-scripts=btoon`). The prebuilds don't need it. It no longer
+  promises source builds with Zstd, LZ4, Brotli or Snappy, which `binding.gyp` can't produce:
+  the package has zlib only. It documents the typed date values and what stays different from
+  `@btoon/js` (`Buffer` results, `compressionAvailable()` and `version()`, `compression: 'auto'`,
+  unused `codecs`, decoded key order).
+- **Tests:** the conformance harness runs the 311 spec 0.3 vectors, re-encodes the date and
+  datetime vectors from `BtoonDate` and `BtoonDateTime`, checks that every canonical vector
+  decoded with `timestamps: 'object'` encodes back to its bytes (only `float/0` skips), and
+  checks the JavaScript type of every integer in both `bigint` modes. New:
+  `test/parity-cases.cjs`, the same cases `@btoon/js` runs with the same expected outcomes;
+  side-by-side runs against `@btoon/js` when `BTOON_JS` points to it (the cases, random
+  values, and hostile getters, `toJSON()` and Proxy traps, which must run identically); the
+  typed-date tests of `@btoon/js`; a worker that rewrites a signed document in shared memory
+  while it is decoded; a type test of `index.d.ts` with TypeScript; and a check that the build
+  and the package use only the core sources the addon needs. CI has a `parity` job that runs the
+  side-by-side comparison against btoon-javascript `main`, or a ref chosen when it's run by hand.
+
 ## 0.2.0 (2026-11-14)
 
 BTOON spec 0.2, on btoon-core 0.2.0: `SPEC_VERSION` is `'0.2'`. The wire format is

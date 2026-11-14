@@ -1,7 +1,8 @@
 # Releasing btoon (npm)
 
 1. Point `core/` at a tagged btoon-core commit (`git -C core checkout vX.Y.Z && git add core`).
-2. Bump `version` in `package.json` and `VERSION` in `index.js`, and update `CHANGELOG.md`.
+2. Bump `version` in `package.json`, `VERSION` in `index.js` and the `VERSION` (and, for a new
+   spec, `SPEC_VERSION`) literal in `index.d.ts`, and update `CHANGELOG.md`.
 3. Push tag `vX.Y.Z`. `.github/workflows/release.yml`:
    - builds Node-API prebuilds with prebuildify on Linux (glibc x64/arm64, musl x64),
      macOS (arm64 + x64) and Windows x64. The glibc ones are built in the manylinux_2_28
