@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const btoon = require('..');
 
-const { Ext, Timestamp, BtoonError } = btoon;
+const { Ext, Timestamp, BtoonDate, BtoonDateTime, BtoonError } = btoon;
 
 function vectorsFile() {
   const root = path.resolve(__dirname, '..');
@@ -54,16 +54,9 @@ function fromTyped(t) {
     case 'array': return x.map(fromTyped);
     case 'map': return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, fromTyped(v)]));
     case 'timestamp': return new Timestamp(BigInt(x.seconds), x.nanoseconds, x.offset_minutes);
-    case 'date': {
-      const ms = BigInt(x);
-      const s = ms >= 0n ? ms / 1000n : (ms - 999n) / 1000n;
-      return new Timestamp(s, Number(ms - s * 1000n) * 1e6);
-    }
-    case 'datetime': {
-      const ns = BigInt(x);
-      const s = ns >= 0n ? ns / 1000000000n : (ns - 999999999n) / 1000000000n;
-      return new Timestamp(s, Number(ns - s * 1000000000n));
-    }
+    // spec §10: the typed values for the date (-2) and datetime (-3) extensions.
+    case 'date': return new BtoonDate(BigInt(x));
+    case 'datetime': return new BtoonDateTime(BigInt(x));
     case 'float32_vector': return floatVector(x, Float32Array);
     case 'float64_vector': return floatVector(x, Float64Array);
     case 'ext': return new Ext(x.type, Buffer.from(x.data, 'hex'));
@@ -71,13 +64,11 @@ function fromTyped(t) {
   }
 }
 
-// Typed values no JS value encodes to, as in @btoon/js: date/datetime (JS has no such types;
-// they decode to Date/Timestamp and re-encode as timestamps, and spec §5.7 forbids writing
-// their ids as a raw Ext), and floats that are safe integers (a JS 2.0 is 2, an int). Other
-// integral floats (2^53, 1e300) and -0 encode as float64.
+// Typed values no JS value encodes to, as in @btoon/js (spec §10): only floats that are safe
+// integers (a JS 2.0 is 2, an int). Other integral floats (2^53, 1e300) and -0 encode as
+// float64, and dates and datetimes re-encode from BtoonDate and BtoonDateTime.
 function reencodable(t) {
   const [[kind, x]] = Object.entries(t);
-  if (kind === 'date' || kind === 'datetime') return false;
   if (kind === 'float') return !Number.isSafeInteger(Number(x)) || Object.is(Number(x), -0);
   if (kind === 'array') return x.every(reencodable);
   if (kind === 'map') return Object.values(x).every(reencodable);
@@ -97,7 +88,9 @@ function same(a, b) {
   if (a instanceof Uint8Array && b instanceof Uint8Array) return Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
   if (a instanceof Ext && b instanceof Ext) return a.type === b.type && same(a.data, b.data);
   if (a instanceof Timestamp && b instanceof Timestamp) {
-    return a.seconds === b.seconds && a.nanoseconds === b.nanoseconds && a.offsetMinutes === b.offsetMinutes;
+    // The exact class too: a timestamp, date and datetime are different BTOON values.
+    return Object.getPrototypeOf(a) === Object.getPrototypeOf(b) && a.seconds === b.seconds && a.nanoseconds === b.nanoseconds &&
+      a.offsetMinutes === b.offsetMinutes && a.epochMilliseconds === b.epochMilliseconds && a.epochNanoseconds === b.epochNanoseconds;
   }
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => same(v, b[i]));
   if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
@@ -106,6 +99,20 @@ function same(a, b) {
     return ka.length === kb.length && ka.every((k, i) => k === kb[i] && same(a[k], b[k]));
   }
   return a === b;
+}
+
+// With bigint: 'auto' an integer is a number when it's a safe integer, with 'always' when it's in
+// [-2^31, 2^32-1]; otherwise a bigint (as in @btoon/js). Checks every integer of a typed value.
+function intTypes(got, t, always) {
+  const [[kind, x]] = Object.entries(t);
+  if (kind === 'int') {
+    const v = BigInt(x);
+    const number = always ? v >= -(2n ** 31n) && v <= 2n ** 32n - 1n : v >= -BigInt(Number.MAX_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER);
+    return typeof got === (number ? 'number' : 'bigint');
+  }
+  if (kind === 'array') return Array.isArray(got) && x.every((e, i) => intTypes(got[i], e, always));
+  if (kind === 'map') return Object.entries(x).every(([k, e]) => intTypes(got[k], e, always));
+  return true;
 }
 
 // The decoder options a vector sets (spec §10). The rest keep the file's defaults.
@@ -162,6 +169,26 @@ test('the decode defaults are the vector file\'s', () => {
   assert.throws(() => btoon.decode(envelope(d.max_decompressed_size)), failsWith('invalid_envelope')); // within the limit
 });
 
+// The builds have zlib only, so the vectors that need another codec are skipped below (each
+// with "<codec> not built"), the lz4-block/* end-of-block cases among them.
+test('vectors that need a codec this build lacks are the ones skipped', () => {
+  const lz4Blocks = VECTORS.vectors.filter((v) => v.id.startsWith('lz4-block/'));
+  assert.ok(lz4Blocks.length >= 8);
+  for (const v of lz4Blocks) assert.equal(v.requires, 'lz4', v.id);
+  assert.equal(btoon.compressionAvailable('lz4'), false);
+  assert.equal(btoon.compressionAvailable('zlib'), true);
+});
+
+// Canonical vectors that skip their re-encoding. The list must be exact: dates and datetimes
+// re-encode from BtoonDate and BtoonDateTime, as the spec 0.3 vectors require.
+const NOT_REENCODED = [];
+test('only float/0 skips its re-encoding', () => {
+  assert.deepStrictEqual(NOT_REENCODED, ['float/0']);
+  for (const id of ['date/max', 'date/min', 'datetime/max', 'datetime/min', 'tabular/date-and-datetime-columns', 'tabular/type-code-9-variants']) {
+    assert.ok(VECTORS.vectors.some((v) => v.id === id && v.canonical), id);
+  }
+});
+
 for (const v of VECTORS.vectors) {
   const skip = v.requires && !btoon.compressionAvailable(v.requires) ? `${v.requires} not built` : false;
   if (v.encode_error !== undefined) {
@@ -186,11 +213,17 @@ for (const v of VECTORS.vectors) {
     assert.ok(same(got, fromTyped(v.value)), `decoded ${String(got)}`);
     const gotAsync = await btoon.decodeAsync(bytes, options);
     assert.ok(same(gotAsync, fromTyped(v.value)), `decodeAsync gave ${String(gotAsync)}`);
+    assert.ok(intTypes(btoon.decode(bytes, decodeOptions(v)), v.value, false), "bigint: 'auto'");
+    assert.ok(intTypes(btoon.decode(bytes, { ...decodeOptions(v), bigint: 'always' }), v.value, true), "bigint: 'always'");
   });
   if (v.canonical) {
+    if (!reencodable(v.value)) NOT_REENCODED.push(v.id);
     test(`re-encodes ${v.id}`, { skip: skip || (!reencodable(v.value) && 'not representable in JS') }, async () => {
       assert.equal(btoon.encode(fromTyped(v.value), encodeOptions(v)).toString('hex'), v.hex);
       assert.equal((await btoon.encodeAsync(fromTyped(v.value), encodeOptions(v))).toString('hex'), v.hex);
+      // What the lossless mode decodes writes the same bytes back (spec §10).
+      const back = btoon.decode(bytes, { ...decodeOptions(v), timestamps: 'object' });
+      assert.equal(btoon.encode(back, encodeOptions(v)).toString('hex'), v.hex);
     });
   }
 }

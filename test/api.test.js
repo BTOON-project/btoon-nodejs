@@ -45,7 +45,12 @@ test('bigint', () => {
   }
   assert.equal(encode(5n).toString('hex'), '05'); // canonical: small bigints are plain ints
   assert.equal(typeof decode(encode(5)), 'number');
-  assert.equal(decode(encode(5), { bigint: 'always' }), 5n);
+  // bigint: 'always' gives a bigint for every integer outside [-2^31, 2^32-1], as @btoon/js does:
+  // what a canonical encoder writes as uint64, int64 or a bigint extension.
+  assert.equal(decode(encode(5), { bigint: 'always' }), 5);
+  assert.equal(decode(encode(2 ** 32 - 1), { bigint: 'always' }), 2 ** 32 - 1);
+  assert.equal(decode(encode(2 ** 32), { bigint: 'always' }), 2n ** 32n);
+  assert.equal(decode(encode(-(2 ** 31) - 1), { bigint: 'always' }), -(2n ** 31n) - 1n);
   assert.equal(decode(encode(2 ** 53 + 2)), 2 ** 53 + 2); // float64 stays a number
 });
 
@@ -87,8 +92,11 @@ test('every view encodes exactly its bytes, Float16Array included', () => {
   const doc = new Uint8Array(4);
   doc.set(encode({ a: 1 }));
   assert.deepStrictEqual(decode(new Float16Array(doc.buffer)), { a: 1 });
-  const ext = new Ext(5, []);
+  // Ext data must be a Uint8Array, as in @btoon/js; its bytes are what's written.
+  const ext = new Ext(5, Uint8Array.of(1));
   ext.data = new Float16Array([1.5]);
+  assert.equal(code(() => encode(ext)), 'invalid_argument');
+  ext.data = new Uint8Array(new Float16Array([1.5]).buffer);
   assert.equal(encode(ext).toString('hex'), 'd505003e');
 });
 
@@ -106,11 +114,14 @@ test('a throwing getter, toJSON or Proxy trap fails encode with that error', asy
       withGetter(this);
     }
   }
-  class Throwing extends Map {
-    [Symbol.iterator]() {
-      throw err;
-    }
-  }
+  // A Map is read with the intrinsic Map methods, so only a proxied one can throw while it is.
+  const throwingMap = new Proxy(new Map([['a', 1]]), {
+    get(t, key) {
+      if (key === 'keys') throw err;
+      const v = Reflect.get(t, key, t);
+      return typeof v === 'function' ? v.bind(t) : v;
+    },
+  });
   const cases = [
     withGetter(),
     withGetter({ a: 1, b: 'x' }),
@@ -120,7 +131,7 @@ test('a throwing getter, toJSON or Proxy trap fails encode with that error', asy
     new Row(),
     [new Row(), new Row()],
     { toJSON: thrower },
-    new Throwing([['a', 1]]),
+    throwingMap,
     new Proxy({ a: 1 }, { get: thrower }),
     new Proxy({ a: 1 }, { ownKeys: thrower }),
     new Proxy({ a: 1 }, { getOwnPropertyDescriptor: thrower }),
@@ -246,6 +257,33 @@ test('tabular encoding is smaller and lossless', () => {
   assert.equal(calls, ROWS.length);
 });
 
+// 0.2 accepted compression: 'auto', which wrote zlib (the builds have only zlib). It stays as a
+// deprecated alias for 'zlib' that warns once per process; @btoon/js doesn't accept it.
+test("compression: 'auto' is a deprecated alias for 'zlib' that warns once", async () => {
+  const warnings = [];
+  const onWarning = (w) => warnings.push(w);
+  process.on('warning', onWarning);
+  try {
+    const value = { rows: Array.from({ length: 300 }, (_, i) => ({ id: i, name: `user${i}` })) };
+    const zlib = encode(value, { compress: true });
+    assert.equal(zlib.subarray(0, 6).toString('hex'), '42544f4e0100'); // a zlib envelope
+    assert.deepStrictEqual(encode(value, { compress: true, compression: 'auto' }), zlib);
+    assert.deepStrictEqual(await encodeAsync(value, { compress: true, compression: 'auto' }), zlib);
+    assert.deepStrictEqual(encode(1, { compression: 'auto' }), encode(1));
+    assert.equal(btoon.compressionAvailable('auto'), btoon.compressionAvailable('zlib'));
+    await new Promise((resolve) => setImmediate(resolve)); // warnings are emitted on the next tick
+  } finally {
+    process.off('warning', onWarning);
+  }
+  assert.deepStrictEqual(warnings.map((w) => [w.name, w.code]), [['DeprecationWarning', 'BTOON_DEP_AUTO']]);
+  assert.match(warnings[0].message, /'auto' is deprecated/);
+  // Anything else that isn't an algorithm is still invalid_argument, as in @btoon/js.
+  for (const compression of ['gzip', 'AUTO', '', null, 1]) {
+    assert.equal(code(() => encode(1, { compression })), 'invalid_argument', String(compression));
+  }
+  assert.equal(btoon.compressionAvailable('gzip'), false);
+});
+
 test('compression, signing and envelope options', () => {
   const packed = encode(ROWS, { compress: true });
   assert.equal(packed.subarray(0, 4).toString(), 'BTON');
@@ -311,6 +349,10 @@ test('ESM entry point', async () => {
   assert.equal(esm.default.VERSION, require('../package.json').version);
   assert.equal(btoon.VERSION, require('../package.json').version);
   assert.deepStrictEqual(esm.decode(esm.encode({ ok: 1 })), { ok: 1 });
+  // The same named exports as CommonJS: index.mjs lacked version() (review 2026-11-13).
+  assert.deepStrictEqual(Object.keys(esm).filter((k) => k !== 'default').sort(), Object.keys(btoon).sort());
+  for (const k of Object.keys(btoon)) assert.equal(esm[k], btoon[k], k);
+  assert.equal(esm.version(), btoon.VERSION);
 });
 
 test('fuzz: hostile bytes only ever raise BtoonError', () => {
@@ -400,7 +442,7 @@ test('Timestamp and Ext fields out of range throw instead of wrapping', async ()
   for (const s of [2n ** 64n + 5n, 2n ** 63n, -(2n ** 63n) - 1n, 2 ** 63, -(2 ** 64), 1.5, NaN, 'x', undefined]) {
     assert.equal(code(() => new Timestamp(s, 0)), 'invalid_argument', `seconds ${String(s)}`);
   }
-  for (const s of [2n ** 63n - 1n, -(2n ** 63n), 2 ** 62]) {
+  for (const s of [2n ** 63n - 1n, -(2n ** 63n), 2n ** 62n, 2 ** 53 - 1]) {
     const t = new Timestamp(s, 999_999_999, -60);
     assert.deepStrictEqual(decode(encode(t), { timestamps: 'object' }), t);
   }
@@ -422,10 +464,10 @@ test('Timestamp and Ext fields out of range throw instead of wrapping', async ()
     [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = 65536 + 60; }],
     [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = 1081; }],
     [() => new Timestamp(0, 0, 60), (t) => { t.offsetMinutes = '60'; }],
-    [() => new Ext(1, [1]), (e) => { e.type = 300; }],
-    [() => new Ext(1, [1]), (e) => { e.type = -129; }],
-    [() => new Ext(1, [1]), (e) => { e.type = 1.5; }],
-    [() => new Ext(1, [1]), (e) => { e.type = '1'; }],
+    [() => new Ext(1, Uint8Array.of(1)), (e) => { e.type = 300; }],
+    [() => new Ext(1, Uint8Array.of(1)), (e) => { e.type = -129; }],
+    [() => new Ext(1, Uint8Array.of(1)), (e) => { e.type = 1.5; }],
+    [() => new Ext(1, Uint8Array.of(1)), (e) => { e.type = '1'; }],
   ];
   for (const [make, mutate] of mutations) {
     const v = make();
@@ -584,12 +626,12 @@ test('maxValues counts every decoded value, on decode and decodeAsync', async ()
 
 test('maxValues is validated like maxDecompressedSize', async () => {
   for (const name of ['maxValues', 'maxDecompressedSize']) {
-    for (const bad of [-1, 1.5, '8', NaN, Infinity, 2 ** 53, true, {}]) {
+    for (const bad of [-1, 1.5, '8', NaN, Infinity, 2 ** 53, true, {}, null]) {
       assert.equal(code(() => decode(hexBuf('01'), { [name]: bad })), 'invalid_argument', `${name}: ${String(bad)}`);
       await assert.rejects(decodeAsync(hexBuf('01'), { [name]: bad }), isCode('invalid_argument'), `${name}: ${String(bad)}`);
     }
     const smallest = name === 'maxValues' ? 1 : 0; // '01' is one value
-    for (const ok of [smallest, 2 ** 53 - 1, undefined, null]) { // undefined and null: the default
+    for (const ok of [smallest, 2 ** 53 - 1, undefined]) { // undefined: the default (null is invalid, as in @btoon/js)
       assert.equal(decode(hexBuf('01'), { [name]: ok }), 1);
       assert.equal(await decodeAsync(hexBuf('01'), { [name]: ok }), 1);
     }
@@ -688,7 +730,7 @@ test('Ext with an id BTOON defines is refused by encode, sync and async', async 
       assert.equal(code(() => encode(v)), 'invalid_argument', `type ${type}`);
       await assert.rejects(encodeAsync(v), isCode('invalid_argument'), `type ${type}`);
     }
-    const mutated = new Ext(5, [1]); // the fields are writable: encode checks the type it sees
+    const mutated = new Ext(5, Uint8Array.of(1)); // the fields are writable: encode checks the type it sees
     mutated.type = type;
     assert.equal(code(() => encode(mutated)), 'invalid_argument', `mutated to ${type}`);
   }
@@ -697,7 +739,7 @@ test('Ext with an id BTOON defines is refused by encode, sync and async', async 
 
 test('Ext with any other id encodes as given', () => {
   for (const type of [-7, -8, -9, -11, -64, -128, 0, 1, 127]) {
-    const bytes = encode(new Ext(type, [5]));
+    const bytes = encode(new Ext(type, Uint8Array.of(5)));
     assert.deepStrictEqual([...bytes], [0xd4, type & 0xff, 5]);
     const back = decode(bytes);
     assert.ok(back instanceof Ext);
@@ -711,4 +753,81 @@ test('non-strict decode still requires UTF-8 keys and column names', async () =>
     assert.equal(await decodeCode(hexBuf(hex), { strict: false }), 'invalid_utf8', hex);
   }
   assert.equal(decode(hexBuf('a1ff'), { strict: false }), '�'); // string values may still be lenient
+});
+
+// binding.gyp compiles only the core sources the addon uses (scripts/core-path.js), so core's
+// other modules can't break a source build on a platform the addon supports otherwise: on
+// Android, an older core's shm_open did. The package must ship exactly those sources.
+test('the addon builds from, and the package ships, only the core sources it uses', () => {
+  const { execFileSync } = require('node:child_process');
+  const path = require('node:path');
+  const root = path.join(__dirname, '..');
+  const sources = execFileSync(process.execPath, [path.join(root, 'scripts/core-path.js'), 'sources'], { cwd: root, encoding: 'utf8' })
+    .trim()
+    .split(' ')
+    .map((f) => path.basename(f))
+    .sort();
+  assert.deepStrictEqual(sources, ['btoon.cpp', 'compression.cpp', 'decoder.cpp', 'encoder.cpp', 'internal.cpp', 'security.cpp', 'sha256.cpp']);
+  const files = require('../package.json').files;
+  const shipped = files.filter((f) => f.startsWith('core/src/') && f.endsWith('.cpp')).map((f) => path.basename(f)).sort();
+  assert.deepStrictEqual(shipped, sources);
+  assert.ok(files.includes('core/src/internal.h') && files.includes('core/include/btoon/*.h'));
+});
+
+// decode(view of a SharedArrayBuffer, { hmacKey }) verified the MAC over shared memory and then
+// parsed that memory again, which another thread can change in between: a worker flipping one
+// byte got 223 forgeries through in the review (2026-11-13). Shared input is now copied once.
+test('a signed document in shared memory: what is verified is what is parsed', async (t) => {
+  const { Worker } = require('node:worker_threads');
+  const key = 'k'.repeat(32);
+  const signed = encode({ a: Buffer.alloc(1 << 20, 0x41), z: 1 }, { hmacKey: key });
+  const sab = new SharedArrayBuffer(signed.length);
+  const view = new Uint8Array(sab);
+  view.set(signed);
+  const last = signed.length - 1; // the value of "z", a positive fixint: 0x01 signed, 0x7f forged
+  const flipper = new Worker(
+    `const { workerData, parentPort } = require('node:worker_threads');
+    const u8 = new Uint8Array(workerData.sab);
+    parentPort.postMessage('ready');
+    for (;;) { Atomics.store(u8, workerData.last, 0x7f); Atomics.store(u8, workerData.last, 0x01); }`,
+    { eval: true, workerData: { sab, last } },
+  );
+  await new Promise((resolve) => flipper.once('message', resolve));
+  const counts = { authentic: 0, forged: 0, rejected: 0 };
+  try {
+    for (let i = 0; i < 200; i++) {
+      for (const input of [view, sab, new DataView(sab), new Uint8Array(sab, 0, signed.length)]) {
+        try {
+          const v = decode(input, { hmacKey: key });
+          if (v.z === 1) counts.authentic++;
+          else counts.forged++;
+        } catch (e) {
+          assert.ok(e instanceof BtoonError && e.code === 'authentication_failed', String(e));
+          counts.rejected++;
+        }
+      }
+    }
+  } finally {
+    await flipper.terminate();
+  }
+  t.diagnostic(JSON.stringify(counts));
+  assert.equal(counts.forged, 0, JSON.stringify(counts));
+  view[last] = 0x01;
+  assert.equal((await decodeAsync(view, { hmacKey: key })).z, 1);
+  view[last] = 0x7f;
+  await assert.rejects(decodeAsync(view, { hmacKey: key }), (e) => e instanceof BtoonError && e.code === 'authentication_failed');
+});
+
+test('decode accepts input in shared memory and copies it first', () => {
+  const doc = encode({ s: 'Grüße, 世界'.repeat(10), n: [1, 2, 3] });
+  const sab = new SharedArrayBuffer(doc.length + 2);
+  new Uint8Array(sab, 2).set(doc);
+  const view = new Uint8Array(sab, 2, doc.length);
+  const out = decode(view);
+  assert.deepStrictEqual(out, { s: 'Grüße, 世界'.repeat(10), n: [1, 2, 3] });
+  assert.deepStrictEqual(decode(new DataView(sab, 2, doc.length)), out);
+  const whole = new SharedArrayBuffer(doc.length);
+  new Uint8Array(whole).set(doc);
+  assert.deepStrictEqual(decode(whole), out);
+  assert.equal(code(() => decode({ [Symbol.toStringTag]: 'ArrayBuffer', length: 1, 0: 5 })), 'invalid_argument');
 });

@@ -4,5 +4,19 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const btoon = require('./index.js');
 
-export const { encode, decode, encodeAsync, decodeAsync, compressionAvailable, BtoonError, Ext, Timestamp, VERSION, SPEC_VERSION } = btoon;
+export const {
+  encode,
+  decode,
+  encodeAsync,
+  decodeAsync,
+  compressionAvailable,
+  BtoonError,
+  Ext,
+  Timestamp,
+  BtoonDate,
+  BtoonDateTime,
+  VERSION,
+  SPEC_VERSION,
+  version,
+} = btoon;
 export default btoon;
